@@ -141,3 +141,18 @@ dist
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
 .vite/
+
+# Caché de Python
+__pycache__/
+*.pyc
+
+# Entornos virtuales de Python
+venv/
+.venv/
+env/
+.env/
+
+# Ignorar archivos específicos del editor y del sistema
+.vscode/
+.idea/
+.DS_Store

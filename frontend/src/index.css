@@ -1,0 +1,93 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  overflow: hidden;
+  font-family: 'Roboto', system-ui, -apple-system, sans-serif;
+  background-color: #eef1f7;
+  color: #1e293b;
+}
+
+/* Thin scrollbar */
+.scrollbar-thin {
+  scrollbar-width: thin;
+  scrollbar-color: #c9d4e5 transparent;
+}
+.scrollbar-thin::-webkit-scrollbar {
+  width: 6px;
+}
+.scrollbar-thin::-webkit-scrollbar-track {
+  background: transparent;
+}
+.scrollbar-thin::-webkit-scrollbar-thumb {
+  background: #c9d4e5;
+  border-radius: 3px;
+}
+
+/* Pulse animation for pending doc dot */
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.35; }
+}
+.animate-pulse-dot {
+  animation: pulse-dot 2s ease-in-out infinite;
+}
+
+input[type="date"] {
+  accent-color: #0d9488;
+  color-scheme: light;
+}
+
+/* Signature overlay — managed imperatively by PdfViewer */
+.rf-sig-overlay {
+  position: absolute;
+  border: 2px dashed #0d9488;
+  border-radius: 6px;
+  background: rgba(13, 148, 136, 0.10);
+  cursor: grab;
+  touch-action: none;
+  box-sizing: border-box;
+  z-index: 10;
+}
+.rf-sig-overlay:active {
+  cursor: grabbing;
+}
+.rf-sig-handle {
+  position: absolute;
+  right: -2px;
+  bottom: -2px;
+  width: 20px;
+  height: 20px;
+  background: #0d9488;
+  border: 2px solid #fff;
+  border-radius: 4px 0 6px 0;
+  cursor: nwse-resize;
+  z-index: 11;
+  touch-action: none;
+  box-sizing: border-box;
+}
+.rf-sig-handle::after {
+  content: '';
+  position: absolute;
+  inset: 4px;
+  border-right: 2px solid #fff;
+  border-bottom: 2px solid #fff;
+}
+
+/* Carrusel Ingreso móvil: un slide por ancho, sin inercia que se coma varias páginas */
+.ingreso-snap {
+  -webkit-overflow-scrolling: touch;
+  scroll-behavior: auto;
+  overscroll-behavior-x: contain;
+}
+
