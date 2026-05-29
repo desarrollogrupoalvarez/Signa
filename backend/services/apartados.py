@@ -258,7 +258,7 @@ def create_apartado(
     else:
         dep_json = depositos_to_json(default_depositos_for_apartado(tmp))
     cat_json = "[]"
-    if modo_flujo == "transferencia" and categorias_destino is not None:
+    if modo_flujo in ("transferencia", "ingreso") and categorias_destino is not None:
         # Legacy: categorías globales → se copian a depósitos sin categorías en el payload
         global_cats = validate_categorias_payload(categorias_destino, modo_flujo=modo_flujo)
         deps_parsed = depositos_from_json(dep_json)
@@ -321,6 +321,11 @@ def apply_apartado_config_fields(ap: "Apartado", data: dict) -> None:
                 setattr(ap, key, data[key])
     if "modo_flujo" in data and ap.modo_flujo not in ("transferencia", "ingreso"):
         raise ValueError("modo_flujo debe ser transferencia o ingreso")
+    for label in ("bandeja_path", "destino_path"):
+        if label in data and data[label] is not None:
+            t = str(data[label]).strip()
+            if not t or not Path(t).is_absolute():
+                raise ValueError(f"{label} requerido y debe ser ruta absoluta (o UNC)")
     if "depositos_config" in data and data["depositos_config"] is not None:
         deps = validate_depositos_payload(
             data["depositos_config"], modo_flujo=ap.modo_flujo

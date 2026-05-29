@@ -34,7 +34,7 @@ if __name__ == "__main__":
     for pth, ac, mf, pr in b_list:
         scan_inbox(pth, apartado_codigo=ac, modo_flujo=mf, prefijo=pr)
         start_watcher(pth, ac, mf, pr)
-    rescan_stop, _rescan_th = start_rescan_loop(_get_tuples_bandeja, interval=10.0)
+    rescan_stop, _rescan_th = start_rescan_loop(_get_tuples_bandeja, interval=60.0)
 
     try:
         serve(app, host="0.0.0.0", port=Config.PORT, threads=4, channel_timeout=120)

@@ -23,6 +23,11 @@ def is_superadmin(role_name: str | None) -> bool:
     return (role_name or "").strip() == "superadmin"
 
 
+def can_reveal_file_location(role_name: str | None) -> bool:
+    r = (role_name or "").strip()
+    return r in ("superadmin", "administrador")
+
+
 def can_gestionar_todos(perms: set[str], role_name: str | None) -> bool:
     return is_superadmin(role_name) or PERM_GESTIONAR in perms
 

@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from datetime import date
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
 from config import Config
 from services import comprobante_tango_store, documents, tango_comprobante_mapper as mapper
@@ -35,10 +35,29 @@ def _parse_fecha_row(row: dict) -> date | None:
         return None
 
 
-def _pdf_en_bandeja(bandeja_dir: Path, filename: str) -> bool:
-    if not filename:
-        return False
-    return (bandeja_dir / filename).is_file()
+def _resolve_pdf_bandeja(
+    bandeja_dir: Path, fname: str, fname_previo: str | None
+) -> Path | None:
+    """PDF existente: nombre canónico, filename en BD o variantes _2, _3."""
+    if not fname:
+        return None
+    canon = bandeja_dir / fname
+    if canon.is_file():
+        return canon
+    if fname_previo:
+        prev = bandeja_dir / fname_previo
+        if prev.is_file():
+            return prev
+    stem = Path(fname).stem
+    if not bandeja_dir.is_dir():
+        return None
+    try:
+        for f in sorted(bandeja_dir.glob(f"{stem}*.pdf")):
+            if f.is_file():
+                return f
+    except OSError:
+        pass
+    return None
 
 
 def _eliminar_pdf_previo(bandeja_dir: Path, pdf_filename_previo: str | None) -> None:
@@ -54,6 +73,117 @@ def _eliminar_pdf_previo(bandeja_dir: Path, pdf_filename_previo: str | None) -> 
     documents.remove_by_path(old_path)
 
 
+def _registrar_y_contar(
+    path_pdf: Path,
+    result: dict[str, Any],
+    *,
+    apartado: "Apartado",
+    clave: str,
+    tango_fecha: date | None,
+    tango_usr: str | None,
+    fuente: str,
+) -> bool:
+    ok = documents.register(
+        path_pdf,
+        silent=True,
+        apartado_codigo=apartado.codigo,
+        modo_flujo=apartado.modo_flujo,
+        prefijo=apartado.prefijo,
+        tango_clave=clave,
+        tango_fecha=tango_fecha.isoformat() if tango_fecha else None,
+        tango_usuario=tango_usr,
+        tango_fuente=fuente,
+        origen="tango",
+    )
+    name = path_pdf.name
+    if ok:
+        result["registrados"].append(name)
+    else:
+        result["omitidos_sin_registro"].append(name)
+        logger.info(
+            "SYNC_SIN_REGISTRO | archivo=%s | clave=%s | ap=%s",
+            name,
+            clave,
+            apartado.codigo,
+        )
+    return ok
+
+
+def _procesar_grupo(
+    db: "Session",
+    apartado: "Apartado",
+    clave: str,
+    grp: list[dict[str, Any]],
+    bandeja_dir: Path,
+    bandeja_root: Path,
+    fuente: str,
+    result: dict[str, Any],
+    *,
+    filename_fn: Callable[[dict], str],
+    map_fn: Callable[[list[dict[str, Any]]], dict[str, Any]],
+    generar_fn: Callable[[dict, Path, dict], Path],
+) -> None:
+    h = grp[0]
+    estado, fname_previo = comprobante_tango_store.get_estado_y_filename(
+        db, apartado.id, clave
+    )
+    if estado == "firmado":
+        result["omitidos_ya_firmados"].append(clave)
+        return
+
+    fname = filename_fn(h)
+    datos = map_fn(grp)
+    tango_usr = str(h.get("USUARIO") or "").strip().upper() or None
+    tango_fecha = _parse_fecha_row(h)
+
+    if fname_previo and fname_previo != fname:
+        _eliminar_pdf_previo(bandeja_dir, fname_previo)
+
+    viejos = mapper.purge_old_format_files(bandeja_dir, fname, h)
+    for v in viejos:
+        documents.remove_by_path(bandeja_dir / v)
+        logger.info("PURGE_VIEJO | %s | %s", fuente, v)
+
+    existing = _resolve_pdf_bandeja(bandeja_dir, fname, fname_previo)
+    if existing:
+        result["omitidos_en_bandeja"].append(existing.name)
+        comprobante_tango_store.upsert_pendiente(
+            db, apartado.id, clave, existing.name, tango_fecha
+        )
+        _registrar_y_contar(
+            existing,
+            result,
+            apartado=apartado,
+            clave=clave,
+            tango_fecha=tango_fecha,
+            tango_usr=tango_usr,
+            fuente=fuente,
+        )
+        return
+
+    documents.remove_pending_by_tango_clave(clave, bandeja_root, delete_file=False)
+
+    try:
+        out = generar_fn(datos, bandeja_dir, h)
+        comprobante_tango_store.upsert_pendiente(
+            db, apartado.id, clave, out.name, tango_fecha
+        )
+        result["generados"].append(out.name)
+        result["generados_por_fuente"].setdefault(fuente, []).append(out.name)
+        _registrar_y_contar(
+            out,
+            result,
+            apartado=apartado,
+            clave=clave,
+            tango_fecha=tango_fecha,
+            tango_usr=tango_usr,
+            fuente=fuente,
+        )
+    except Exception as ex:
+        logger.exception("sync_apartado gen %s [%s]: %s", clave, fuente, ex)
+        result["errores"].append(f"{fuente}/{clave}: {ex}")
+
+
 def _procesar_grupos_transferencia(
     db: "Session",
     apartado: "Apartado",
@@ -63,72 +193,20 @@ def _procesar_grupos_transferencia(
     fuente: str,
     result: dict[str, Any],
 ) -> None:
-
     for clave, grp in groups.items():
-        h = grp[0]
-        estado, fname_previo = comprobante_tango_store.get_estado_y_filename(
-            db, apartado.id, clave
+        _procesar_grupo(
+            db,
+            apartado,
+            clave,
+            grp,
+            bandeja_dir,
+            bandeja_root,
+            fuente,
+            result,
+            filename_fn=mapper.filename_transferencia,
+            map_fn=mapper.map_transferencia_group,
+            generar_fn=mapper.generar_pdf_transferencia,
         )
-        if estado == "firmado":
-            result["omitidos_ya_firmados"].append(clave)
-            continue
-
-        fname = mapper.filename_transferencia(h)
-        datos = mapper.map_transferencia_group(grp)
-        tango_usr = str(h.get("USUARIO") or "").strip().upper() or None
-
-        if fname_previo and fname_previo != fname:
-            _eliminar_pdf_previo(bandeja_dir, fname_previo)
-
-        documents.remove_pending_by_tango_clave(clave, bandeja_root)
-
-        viejos = mapper.purge_old_format_files(bandeja_dir, fname, h)
-        for v in viejos:
-            documents.remove_by_path(bandeja_dir / v)
-            logger.info("PURGE_VIEJO | %s | %s", fuente, v)
-
-        if _pdf_en_bandeja(bandeja_dir, fname):
-            result["omitidos_en_bandeja"].append(fname)
-            tango_fecha = _parse_fecha_row(h)
-            comprobante_tango_store.upsert_pendiente(db, apartado.id, clave, fname, tango_fecha)
-            path_pdf = bandeja_dir / fname
-            documents.register(
-                path_pdf,
-                silent=True,
-                apartado_codigo=apartado.codigo,
-                modo_flujo=apartado.modo_flujo,
-                prefijo=apartado.prefijo,
-                tango_clave=clave,
-                tango_fecha=tango_fecha.isoformat() if tango_fecha else None,
-                tango_usuario=tango_usr,
-                tango_fuente=fuente,
-                origen="tango",
-            )
-            continue
-
-        try:
-            out = mapper.generar_pdf_transferencia(datos, bandeja_dir, h)
-            tango_fecha = _parse_fecha_row(h)
-            comprobante_tango_store.upsert_pendiente(
-                db, apartado.id, clave, out.name, tango_fecha
-            )
-            documents.register(
-                out,
-                silent=True,
-                apartado_codigo=apartado.codigo,
-                modo_flujo=apartado.modo_flujo,
-                prefijo=apartado.prefijo,
-                tango_clave=clave,
-                tango_fecha=tango_fecha.isoformat() if tango_fecha else None,
-                tango_usuario=tango_usr,
-                tango_fuente=fuente,
-                origen="tango",
-            )
-            result["generados"].append(out.name)
-            result["generados_por_fuente"].setdefault(fuente, []).append(out.name)
-        except Exception as ex:
-            logger.exception("sync_apartado gen %s [%s]: %s", clave, fuente, ex)
-            result["errores"].append(f"{fuente}/{clave}: {ex}")
 
 
 def _procesar_grupos_ingreso(
@@ -140,70 +218,46 @@ def _procesar_grupos_ingreso(
     fuente: str,
     result: dict[str, Any],
 ) -> None:
-    bandeja = bandeja_dir
-
     for clave, grp in groups.items():
-        h = grp[0]
-        estado, fname_previo = comprobante_tango_store.get_estado_y_filename(
-            db, apartado.id, clave
+        _procesar_grupo(
+            db,
+            apartado,
+            clave,
+            grp,
+            bandeja_dir,
+            bandeja_root,
+            fuente,
+            result,
+            filename_fn=mapper.filename_ingreso,
+            map_fn=mapper.map_ingreso_group,
+            generar_fn=mapper.generar_pdf_ingreso,
         )
-        if estado == "firmado":
-            result["omitidos_ya_firmados"].append(clave)
-            continue
 
-        fname = mapper.filename_ingreso(h)
-        datos = mapper.map_ingreso_group(grp)
-        tango_usr = str(h.get("USUARIO") or "").strip().upper() or None
 
-        if fname_previo and fname_previo != fname:
-            _eliminar_pdf_previo(bandeja, fname_previo)
-
-        documents.remove_pending_by_tango_clave(clave, bandeja_root)
-
-        viejos = mapper.purge_old_format_files(bandeja, fname, h)
-        for v in viejos:
-            documents.remove_by_path(bandeja / v)
-            logger.info("PURGE_VIEJO | %s | %s", fuente, v)
-
-        if _pdf_en_bandeja(bandeja, fname):
-            result["omitidos_en_bandeja"].append(fname)
-            tango_fecha = _parse_fecha_row(h)
-            comprobante_tango_store.upsert_pendiente(db, apartado.id, clave, fname, tango_fecha)
-            documents.register(
-                bandeja / fname,
-                silent=True,
-                apartado_codigo=apartado.codigo,
-                modo_flujo=apartado.modo_flujo,
-                prefijo=apartado.prefijo,
-                tango_clave=clave,
-                tango_fecha=tango_fecha.isoformat() if tango_fecha else None,
-                tango_usuario=tango_usr,
-                tango_fuente=fuente,
-                origen="tango",
-            )
-            continue
-
-        try:
-            out = mapper.generar_pdf_ingreso(datos, bandeja, h)
-            tango_fecha = _parse_fecha_row(h)
-            comprobante_tango_store.upsert_pendiente(db, apartado.id, clave, out.name, tango_fecha)
-            documents.register(
-                out,
-                silent=True,
-                apartado_codigo=apartado.codigo,
-                modo_flujo=apartado.modo_flujo,
-                prefijo=apartado.prefijo,
-                tango_clave=clave,
-                tango_fecha=tango_fecha.isoformat() if tango_fecha else None,
-                tango_usuario=tango_usr,
-                tango_fuente=fuente,
-                origen="tango",
-            )
-            result["generados"].append(out.name)
-            result["generados_por_fuente"].setdefault(fuente, []).append(out.name)
-        except Exception as ex:
-            logger.exception("sync_apartado gen %s [%s]: %s", clave, fuente, ex)
-            result["errores"].append(f"{fuente}/{clave}: {ex}")
+def _log_sync_resumen(apartado: "Apartado", fecha: date, result: dict[str, Any]) -> None:
+    """Resumen estructurado para diagnosticar desvíos toast vs lista (p. ej. 9 vs 7)."""
+    logger.info(
+        "sync_tango_resumen | apartado=%s | fecha=%s | usuarios=%s | "
+        "comprobantes_detectados=%d | generados=%d | registrados=%d | "
+        "omitidos_bandeja=%d | omitidos_sin_registro=%d | omitidos_firmados=%d | errores=%d",
+        apartado.codigo,
+        fecha.isoformat(),
+        ",".join(result.get("usuarios_consultados") or []),
+        result.get("comprobantes_detectados", 0),
+        len(result.get("generados") or []),
+        len(result.get("registrados") or []),
+        len(result.get("omitidos_en_bandeja") or []),
+        len(result.get("omitidos_sin_registro") or []),
+        len(result.get("omitidos_ya_firmados") or []),
+        len(result.get("errores") or []),
+    )
+    sin_reg = result.get("omitidos_sin_registro") or []
+    if sin_reg:
+        logger.warning(
+            "sync_tango_sin_registro | apartado=%s | archivos=%s",
+            apartado.codigo,
+            ",".join(sin_reg[:20]),
+        )
 
 
 def sync_apartado(
@@ -216,7 +270,9 @@ def sync_apartado(
 ) -> dict[str, Any]:
     result: dict[str, Any] = {
         "generados": [],
+        "registrados": [],
         "omitidos_en_bandeja": [],
+        "omitidos_sin_registro": [],
         "omitidos_ya_firmados": [],
         "errores": [],
         "usuarios_consultados": [],
@@ -352,4 +408,6 @@ def sync_apartado(
     except Exception as ex:
         db.rollback()
         result["errores"].append(f"commit: {ex}")
+
+    _log_sync_resumen(apartado, fecha, result)
     return result

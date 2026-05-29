@@ -9,9 +9,27 @@ from pathlib import Path
 import fitz
 from PIL import Image
 
+SIGNATURE_INSERT_DPI = 220
+
 
 def _clamp(v: float) -> float:
     return max(0.0, min(1.0, v))
+
+
+def _upscale_signature_if_needed(img: Image.Image, rect: fitz.Rect) -> Image.Image:
+    """Escala la firma si llega con pocos píxeles para el rectángulo en el PDF."""
+    scale = SIGNATURE_INSERT_DPI / 72.0
+    target_w = max(1, int(rect.width * scale))
+    target_h = max(1, int(rect.height * scale))
+    iw, ih = img.size
+    if iw >= target_w and ih >= target_h:
+        return img
+    ratio = min(target_w / iw, target_h / ih)
+    if ratio <= 1.0:
+        return img
+    nw = max(1, int(iw * ratio))
+    nh = max(1, int(ih * ratio))
+    return img.resize((nw, nh), Image.Resampling.LANCZOS)
 
 
 def sign_pdf(source: Path, firma_b64: str, page_num: int, placement: dict, dest_dir: Path) -> Path:
@@ -46,6 +64,10 @@ def sign_pdf(source: Path, firma_b64: str, page_num: int, placement: dict, dest_
     page = doc[page_num - 1]
     pr = page.rect
     rect = fitz.Rect(x * pr.width, y * pr.height, (x + w) * pr.width, (y + h) * pr.height)
+    img = _upscale_signature_if_needed(img, rect)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    firma_bytes = buf.getvalue()
     page.insert_image(rect, stream=firma_bytes)
 
     dest_dir.mkdir(parents=True, exist_ok=True)

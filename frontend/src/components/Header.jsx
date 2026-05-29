@@ -57,7 +57,7 @@ function TangoSyncControls({
         type="button"
         disabled={syncingTango}
         onClick={() => onTangoSync?.()}
-        title="Sincronizar desde Tango"
+        title="Sincroniza comprobantes desde Tango y actualiza la lista de pendientes"
         className={[
           'inline-flex shrink-0 items-center justify-center gap-1.5 rounded-lg border border-accent bg-accent/10 font-bold text-accent disabled:opacity-50',
           compact ? 'px-2.5 py-1.5 text-[10px]' : 'px-2.5 py-1 text-[11px]',

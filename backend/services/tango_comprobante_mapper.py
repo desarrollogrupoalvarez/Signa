@@ -239,10 +239,14 @@ def parse_meta_from_filename(name: str) -> tuple[str | None, str | None]:
     def _user_from_tail() -> str | None:
         if len(parts) < 2:
             return None
-        if _last_segment_is_id(parts[-1]):
+        tail = parts[-1]
+        if _last_segment_is_id(tail):
             u = parts[-2] if len(parts) >= 2 else None
+        elif tail.isdigit() and len(parts) >= 3:
+            # TRA_yyyymmdd_num_usuario_IdSTA14
+            u = parts[-2]
         else:
-            u = parts[-1]
+            u = tail
         return (u or "").strip().upper() or None
 
     if kind == "TRA":

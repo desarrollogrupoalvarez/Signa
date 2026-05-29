@@ -32,6 +32,32 @@ def _norm_ruta(s: str) -> str:
     return os.path.normpath(t) if t else t
 
 
+def resolve_storage_path(path_str: str | None) -> Path:
+    """
+    Ruta absoluta para bandeja/destino.
+    Relativas: primero respecto al cwd del proceso (p. ej. backend/ al usar server.py),
+    luego raíz del proyecto — debe coincidir con dónde el watcher ya encuentra pendientes.
+    """
+    from config import Config
+
+    raw = (path_str or "").strip()
+    if not raw:
+        return Path()
+    p = Path(raw)
+    if p.is_absolute():
+        try:
+            return p.resolve()
+        except OSError:
+            return p
+    cand_cwd = (Path.cwd() / p).resolve()
+    cand_base = (Config.BASE_DIR / p).resolve()
+    if cand_cwd.exists():
+        return cand_cwd
+    if cand_base.exists():
+        return cand_base
+    return cand_cwd
+
+
 def get_legacy_merged(db: "Session | None" = None) -> dict[str, str]:
     """
     Fallback legacy: solo env (sin pasar por tablas `apartados`).
@@ -88,3 +114,30 @@ def get_resolved_paths(db: "Session | None" = None) -> dict[str, str]:
         if db is not None:
             _cache = result
         return result
+
+
+def scan_roots_for_apartado(apartado) -> list[Path]:
+    """Carpetas de destino (firmados). No escanea bandeja para no mezclar con pendientes."""
+    from services.apartado_paths import destino_deposito_root, parse_depositos
+
+    seen: set[str] = set()
+    roots: list[Path] = []
+
+    def add(path: Path | None) -> None:
+        if not path:
+            return
+        try:
+            key = str(path.resolve())
+        except OSError:
+            key = str(path)
+        if key in seen:
+            return
+        seen.add(key)
+        roots.append(path)
+
+    dest = resolve_storage_path(getattr(apartado, "destino_path", None))
+    add(dest)
+    for dep in parse_depositos(apartado):
+        if dest:
+            add(destino_deposito_root(dest, dep.carpeta))
+    return roots

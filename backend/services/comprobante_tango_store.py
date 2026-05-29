@@ -66,3 +66,39 @@ def mark_firmado(db: "Session", apartado_id: int, clave: str) -> None:
     if row:
         row.estado = "firmado"
         db.flush()
+
+
+def clave_by_pdf_filename(db: "Session", apartado_id: int, pdf_filename: str) -> str | None:
+    name = (pdf_filename or "").strip()
+    if not name:
+        return None
+    row = (
+        db.query(ComprobanteTango)
+        .filter(
+            ComprobanteTango.apartado_id == apartado_id,
+            ComprobanteTango.pdf_filename == name,
+        )
+        .first()
+    )
+    return (row.clave or "").strip() or None if row else None
+
+
+def firmado_claves_by_apartado_ids(
+    db: "Session", apartado_ids: set[int]
+) -> dict[int, set[str]]:
+    if not apartado_ids:
+        return {}
+    rows = (
+        db.query(ComprobanteTango.apartado_id, ComprobanteTango.clave)
+        .filter(
+            ComprobanteTango.apartado_id.in_(apartado_ids),
+            ComprobanteTango.estado == "firmado",
+        )
+        .all()
+    )
+    out: dict[int, set[str]] = {}
+    for aid, clave in rows:
+        c = (clave or "").strip()
+        if c:
+            out.setdefault(int(aid), set()).add(c)
+    return out

@@ -43,15 +43,17 @@ export default function SignaturePanel({
     const resize = () => {
       const side = Math.max(canvas.offsetWidth, canvas.offsetHeight) || 280
       const ratio = Math.max(window.devicePixelRatio || 1, 1)
-      canvas.width = Math.round(side * ratio)
-      canvas.height = Math.round(side * ratio)
-      canvas.getContext('2d').scale(ratio, ratio)
+      const exportScale = 2.5
+      const pixelRatio = ratio * exportScale
+      canvas.width = Math.round(side * pixelRatio)
+      canvas.height = Math.round(side * pixelRatio)
+      canvas.getContext('2d').scale(pixelRatio, pixelRatio)
       padRef.current?.clear()
     }
 
     const pad = new SignaturePad(canvas, {
-      minWidth: 0.85,
-      maxWidth: 0.85,
+      minWidth: 0.6,
+      maxWidth: 0.9,
       penColor: '#000000',
       backgroundColor: 'rgba(0,0,0,0)',
     })

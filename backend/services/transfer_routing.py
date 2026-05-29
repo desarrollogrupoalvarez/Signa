@@ -81,6 +81,16 @@ def parse_keywords_csv(raw: str | None) -> tuple[str, ...]:
     return tuple(out)
 
 
+def parse_doc_date(name: str) -> tuple[int, int, int] | None:
+    """Fecha en nombre de archivo TRA o IN/ING."""
+    tra = parse_tra_date(name)
+    if tra:
+        return tra
+    from services.ingreso_routing import parse_in_date
+
+    return parse_in_date(name)
+
+
 def parse_tra_date(name: str) -> tuple[int, int, int] | None:
     m = _TRA_NAME.match(Path(name).name)
     if not m:
@@ -115,40 +125,59 @@ def parse_tra_date(name: str) -> tuple[int, int, int] | None:
     return y, mo, day
 
 
-def _categoria_para_texto(
-    text: str,
+def _norm_codigo(c: str) -> str:
+    return (c or "").strip().upper()
+
+
+def _codigos_from_categoria(cat: "CategoriaConfig") -> tuple[str, ...]:
+    raw = getattr(cat, "codigos_articulo", None) or cat.keywords or ""
+    return tuple(_norm_codigo(k) for k in parse_keywords_csv(raw) if k)
+
+
+def _categoria_para_codigos(
+    codigos_articulo: set[str],
     categorias: list["CategoriaConfig"],
     *,
     keywords_importante: tuple[str, ...] | None = None,
+    text_fallback: str = "",
 ) -> str:
+    norm_doc = {_norm_codigo(c) for c in codigos_articulo if c}
     if categorias:
         for cat in categorias:
-            if not cat.keywords:
+            keys = _codigos_from_categoria(cat)
+            if not keys:
                 continue
-            keys = parse_keywords_csv(cat.keywords)
-            if keys and is_important_by_description(text, keys):
+            if norm_doc and any(k in norm_doc for k in keys):
                 return cat.nombre
         for cat in categorias:
-            if not cat.keywords:
+            if not _codigos_from_categoria(cat):
                 return cat.nombre
         return categorias[0].nombre
 
-    important = is_important_by_description(text, keywords_importante)
-    return "Importante" if important else "Regulares"
+    if keywords_importante and text_fallback:
+        important = is_important_by_description(text_fallback, keywords_importante)
+        return "Importante" if important else "Regulares"
+    return "Regulares"
 
 
 def classify_routing(
     filename: str,
-    text: str,
+    codigos_articulo: set[str] | None = None,
     *,
     keywords_importante: tuple[str, ...] | None = None,
     categorias: list["CategoriaConfig"] | None = None,
+    text_fallback: str = "",
 ) -> RoutingResult:
     """
     Determina subcarpeta relativa (sin raíz de depósito) y tipo.
     """
-    tra = parse_tra_date(filename)
-    tier = _categoria_para_texto(text, categorias or [], keywords_importante=keywords_importante)
+    tra = parse_doc_date(filename)
+    tier = _categoria_para_codigos(
+        codigos_articulo or set(),
+        categorias or [],
+        keywords_importante=keywords_importante,
+        text_fallback=text_fallback,
+    )
 
     if tra:
         y, mo, _ = tra
@@ -167,16 +196,18 @@ def classify_routing(
 def destination_dir(
     deposito_root: Path,
     filename: str,
-    text: str,
+    codigos_articulo: set[str] | None = None,
     *,
     keywords_importante: tuple[str, ...] | None = None,
     categorias: list["CategoriaConfig"] | None = None,
+    text_fallback: str = "",
 ) -> Path:
     r = classify_routing(
         filename,
-        text,
+        codigos_articulo,
         keywords_importante=keywords_importante,
         categorias=categorias,
+        text_fallback=text_fallback,
     )
     p = deposito_root
     for part in r.rel_dir_parts:

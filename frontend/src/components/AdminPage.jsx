@@ -455,7 +455,7 @@ function ApartadoPathsPanel() {
                             })
                           }
                           disabled={loading}
-                          placeholder="Palabras clave (opcional)"
+                          placeholder="Códigos artículo COD_ARTICU (coma, opcional)"
                           spellCheck={false}
                         />
                         <button
@@ -514,7 +514,7 @@ function ApartadoPathsPanel() {
             </button>
             <p className="text-[11px] text-app-muted">
               PDFs pendientes en <span className="font-semibold">{'{carpeta}/Sin Firmar/'}</span>. Cada depósito define
-              sus propias categorías de destino al firmar.
+              sus propias categorías de destino al firmar (por código de artículo COD_ARTICU).
             </p>
           </div>
         </Field>

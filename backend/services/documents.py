@@ -10,6 +10,14 @@ import logging
 from datetime import datetime
 from pathlib import Path
 
+from services.file_ops import safe_unlink
+from services.pending_guard import (
+    destino_paths_for_codigos,
+    doc_is_firmado_in_db,
+    firmado_claves_by_apartado_codigo,
+    should_skip_pending_registration,
+)
+from services.file_search import file_search_matches
 from services.tango_comprobante_mapper import parse_meta_from_filename
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
@@ -152,6 +160,9 @@ def register(
     if mf not in ("transferencia", "ingreso"):
         ac, mf, pr = _legacy_categoria_to_apart("tra")
 
+    if should_skip_pending_registration(path, ac, tango_clave=tango_clave):
+        return False
+
     fecha_res, usuario_res = _resolve_tango_meta(
         path.name, tango_fecha=tango_fecha, tango_usuario=tango_usuario
     )
@@ -260,9 +271,11 @@ def get_bandeja_tuples_for_rescan() -> list[tuple[Path, str, str, str]]:
 
     db = SessionLocal()
     try:
+        from services.path_settings import resolve_storage_path
+
         rows = apartados.list_active_apartados(db)
         return [
-            (Path(a.bandeja_path), a.codigo, a.modo_flujo, a.prefijo)
+            (resolve_storage_path(a.bandeja_path), a.codigo, a.modo_flujo, a.prefijo)
             for a in rows
         ]
     finally:
@@ -340,9 +353,14 @@ def list_pending(
     *,
     filter_username: str | None = None,
     filter_fecha: str | None = None,
+    filter_q: str | None = None,
 ) -> list[dict]:
     want_user = _norm_tango_usuario(filter_username)
     want_fecha = (filter_fecha or "").strip()[:10] or None
+    want_q = (filter_q or "").strip() or None
+    codes = allowed_apartado_codes or set()
+    firmado_map = firmado_claves_by_apartado_codigo(codes) if codes else {}
+    destino_map = destino_paths_for_codigos(codes) if codes else {}
 
     with _lock:
         ids_to_remove = [
@@ -358,13 +376,23 @@ def list_pending(
                 return False
             if allowed_apartado_codes is not None and doc.get("apartado_codigo") not in allowed_apartado_codes:
                 return False
-            enrich_tango_meta(doc)
-            owner = doc.get("tango_usuario")
-            if want_user and owner and owner != want_user:
+            if doc_is_firmado_in_db(doc, firmado_map, destino_map):
                 return False
+            enrich_tango_meta(doc)
+            owner = _norm_tango_usuario(doc.get("tango_usuario"))
+            if want_user:
+                if not owner or owner != want_user:
+                    return False
             doc_fecha = doc.get("tango_fecha")
             if want_fecha and doc_fecha and doc_fecha != want_fecha:
                 return False
+            if want_q:
+                ruta = doc.get("ruta", "")
+                try:
+                    if not file_search_matches(Path(ruta), want_q):
+                        return False
+                except OSError:
+                    return False
             return True
 
         return sorted(
@@ -374,6 +402,7 @@ def list_pending(
                 if include(doc)
             ],
             key=lambda d: d["recibido_en"],
+            reverse=True,
         )
 
 
@@ -393,11 +422,15 @@ def remove_by_path(path: Path) -> None:
             logger.info("PENDIENTE_QUITADO | id=%s | archivo=%s", doc_id, path.name)
 
 
-def remove_pending_by_tango_clave(tango_clave: str, bandeja: Path) -> None:
+def remove_pending_by_tango_clave(
+    tango_clave: str, bandeja: Path, *, delete_file: bool = False
+) -> None:
     """
     Quita del store pendientes que compartan la tango_clave dada y
-    además estén en la bandeja indicada. Si el archivo aún existe en disco,
-    también lo elimina.
+    estén bajo la bandeja indicada.
+
+    Por defecto no borra el PDF en disco (sync Tango reutiliza archivos existentes).
+    Pasar delete_file=True solo al reemplazar por un nombre distinto.
     """
     if not tango_clave:
         return
@@ -414,13 +447,11 @@ def remove_pending_by_tango_clave(tango_clave: str, bandeja: Path) -> None:
             if doc:
                 ruta = doc.get("ruta", "")
                 logger.info("PENDIENTE_REEMPLAZADO | id=%s | archivo=%s", did, Path(ruta).name)
-                try:
+                if delete_file:
                     p = Path(ruta)
                     if p.is_file():
-                        p.unlink()
-                        logger.info("PDF_VIEJO_ELIMINADO_STORE | archivo=%s", p.name)
-                except OSError as ex:
-                    logger.warning("No se pudo eliminar PDF viejo %s: %s", ruta, ex)
+                        if safe_unlink(p):
+                            logger.info("PDF_VIEJO_ELIMINADO_STORE | archivo=%s", p.name)
 
 
 def _path_exists(ruta: str) -> bool:
@@ -438,9 +469,20 @@ def scan_inbox(
     prefijo: str = "t",
 ) -> None:
     bandeja.mkdir(parents=True, exist_ok=True)
-    from services.apartado_paths import infer_tango_fuente_from_path
+    from core.database import SessionLocal
+    from services import apartados as apartados_svc
+    from services.apartado_paths import infer_tango_fuente_from_path, iter_bandeja_inbox_pdfs
 
-    for pdf in bandeja.rglob("*.pdf"):
+    db = SessionLocal()
+    try:
+        a = apartados_svc.get_by_codigo(db, apartado_codigo, active_only=False)
+        pdfs = iter_bandeja_inbox_pdfs(a) if a else [
+            p for p in bandeja.rglob("*.pdf") if p.is_file()
+        ]
+    finally:
+        db.close()
+
+    for pdf in pdfs:
         fecha_p, usuario_p = _resolve_tango_meta(pdf.name)
         register(
             pdf,
@@ -523,10 +565,26 @@ def stop_inbox_watcher() -> None:
             logger.warning("Al detener observer: %s", e)
 
 
+def _use_polling_observer(bandeja: Path) -> bool:
+    from config import Config
+
+    if os.name == "nt":
+        return True
+    if Config.WATCHDOG_USE_POLLING:
+        return True
+    s = str(bandeja).replace("\\", "/")
+    return s.startswith("/mnt/") or s.startswith("/media/")
+
+
 def _create_watcher(bandeja: Path, apartado_codigo: str, modo_flujo: str, prefijo: str):
+    from config import Config
+
     bandeja.mkdir(parents=True, exist_ok=True)
     handler = _BandejaHandler(apartado_codigo, modo_flujo, prefijo)
-    observer = PollingObserver(timeout=2.0) if os.name == "nt" else Observer()
+    if _use_polling_observer(bandeja):
+        observer = PollingObserver(timeout=Config.WATCHDOG_POLLING_TIMEOUT)
+    else:
+        observer = Observer()
     observer.schedule(handler, str(bandeja), recursive=True)
     observer.start()
     logger.info("Watcher %s en: %s", apartado_codigo, bandeja)
@@ -540,33 +598,41 @@ def start_watcher(bandeja: Path, apartado_codigo: str, modo_flujo: str, prefijo:
     return obs
 
 
-def start_rescan_loop(get_bandeja_tuples, interval: float = 10.0):
+def start_rescan_loop(get_bandeja_tuples, interval: float = 60.0):
     stop = threading.Event()
 
     def _loop():
         while not stop.wait(interval):
             try:
                 row = get_bandeja_tuples()
-                for bandeja, ac, mf, pr in row:
-                    if not bandeja.is_dir():
-                        continue
-                    from services.apartado_paths import infer_tango_fuente_from_path
+                from core.database import SessionLocal
+                from services import apartados as apartados_svc
+                from services.apartado_paths import infer_tango_fuente_from_path, iter_bandeja_inbox_pdfs
 
-                    for pdf in bandeja.rglob("*.pdf"):
-                        if register(
-                            pdf,
-                            silent=True,
-                            apartado_codigo=ac,
-                            modo_flujo=mf,
-                            prefijo=pr,
-                            tango_fuente=infer_tango_fuente_from_path(pdf),
-                        ):
-                            logger.info(
-                                "NUEVO_DOCUMENTO | id=%s | archivo=%s | origen=rescaneo | ap=%s",
-                                _doc_id(pdf),
-                                pdf.name,
-                                ac,
-                            )
+                db = SessionLocal()
+                try:
+                    for bandeja, ac, mf, pr in row:
+                        if not bandeja.is_dir():
+                            continue
+                        a = apartados_svc.get_by_codigo(db, ac, active_only=False)
+                        pdfs = iter_bandeja_inbox_pdfs(a) if a else []
+                        for pdf in pdfs:
+                            if register(
+                                pdf,
+                                silent=True,
+                                apartado_codigo=ac,
+                                modo_flujo=mf,
+                                prefijo=pr,
+                                tango_fuente=infer_tango_fuente_from_path(pdf),
+                            ):
+                                logger.info(
+                                    "NUEVO_DOCUMENTO | id=%s | archivo=%s | origen=rescaneo | ap=%s",
+                                    _doc_id(pdf),
+                                    pdf.name,
+                                    ac,
+                                )
+                finally:
+                    db.close()
             except Exception as ex:
                 logger.warning("Rescaneo: %s", ex)
 

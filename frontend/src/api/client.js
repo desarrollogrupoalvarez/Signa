@@ -12,10 +12,15 @@ export async function apiFetch(path, options = {}) {
     ...(token ? { Authorization: `Bearer ${token}` } : {}),
     ...(options.headers || {}),
   }
-  const cache = typeof options.cache !== 'undefined'
-    ? options.cache
-    : (String(path || '').startsWith('/api/metricas/') ? 'no-store' : undefined)
-  const res = await fetch(API_BASE + path, { ...options, headers, ...(cache ? { cache } : {}) })
+  const cache =
+    typeof options.cache !== 'undefined' ? options.cache : 'no-store'
+  const { signal, ...rest } = options
+  const res = await fetch(API_BASE + path, {
+    ...rest,
+    headers,
+    cache,
+    ...(signal ? { signal } : {}),
+  })
 
   if (!res.ok) {
     if (res.status === 401) {

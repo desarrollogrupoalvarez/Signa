@@ -89,6 +89,18 @@ class Config:
     TANGO_DB_CTC = os.environ.get("TANGO_DB_CTC", "").strip()
     TANGO_QUERY_TIMEOUT = int(os.environ.get("TANGO_QUERY_TIMEOUT", "60") or "60")
 
+    # Watchdog: polling en Windows, Linux con mount de red o WATCHDOG_USE_POLLING=1
+    WATCHDOG_USE_POLLING = os.environ.get("WATCHDOG_USE_POLLING", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    WATCHDOG_POLLING_TIMEOUT = float(os.environ.get("WATCHDOG_POLLING_TIMEOUT", "2.5") or "2.5")
+
+    # Linux: mapeo mount -> UNC para clientes Windows (Abrir ubicación)
+    # Ej: /mnt/signa/transferencias=\\SERVIDOR\\Transferencias;/mnt/signa/bandeja=\\SERVIDOR\\Bandeja
+    STORAGE_CLIENT_PATH_MAP = os.environ.get("STORAGE_CLIENT_PATH_MAP", "").strip()
+
     @classmethod
     def tango_transferencia_sources(cls) -> list[TangoTransferenciaSource]:
         out: list[TangoTransferenciaSource] = []

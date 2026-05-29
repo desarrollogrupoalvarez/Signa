@@ -9,6 +9,7 @@ import mimetypes
 import os
 import shutil
 import subprocess
+import time
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -19,6 +20,7 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 
 from config import Config
 from core.apartado_access import apartado_codes_for_user
+from core.apartado_admin import can_reveal_file_location
 from core.database import SessionLocal
 from models.user import User
 from services import apartados as apartados_svc
@@ -67,6 +69,15 @@ def _close_db(error):
     db = g.pop("db", None)
     if db is not None:
         db.close()
+
+
+@app.after_request
+def _no_cache_sensitive_lists(response):
+    if request.method == "GET" and request.path in ("/api/documentos", "/api/firmados"):
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Vary"] = "Authorization"
+    return response
 
 
 # ── Blueprints ────────────────────────────────────────────────────────────────
@@ -201,15 +212,30 @@ def list_documents():
     if not ap:
         return jsonify({"documentos": []})
     u = _current_db_user()
-    role = u.role.name if u.role else None
-    filter_user = None if role == "superadmin" else (u.username or "").strip().upper() or None
+    role = (u.role.name if u.role else None) or g.current_user.get("role")
+    jwt_user = (g.current_user.get("username") or "").strip().upper() or None
+    db_user = (u.username or "").strip().upper() or None
+    if jwt_user and db_user and jwt_user != db_user:
+        logger.warning(
+            "LIST_DOCUMENTOS_USER_MISMATCH | jwt=%s | db=%s | sub=%s",
+            jwt_user,
+            db_user,
+            g.current_user.get("sub"),
+        )
+    filter_user = (
+        None
+        if role in ("superadmin", "administrador")
+        else (db_user or jwt_user)
+    )
     fecha_q = (request.args.get("fecha") or "").strip()[:10] or None
+    q = (request.args.get("q") or "").strip() or None
     return jsonify(
         {
             "documentos": documents.list_pending(
                 ap,
                 filter_username=filter_user,
                 filter_fecha=fecha_q,
+                filter_q=q,
             )
         }
     )
@@ -248,11 +274,16 @@ def _ingreso_copiar_a_destino_y_marcar(doc: dict, db, dispositivo: str) -> dict:
         documents.remove(doc_id)
         abort(404, "Archivo no encontrado")
     try:
-        dest_root = Path(a.destino_path)
+        from services.path_settings import resolve_storage_path
+
+        dest_root = resolve_storage_path(a.destino_path)
         dest_dir = _resolve_dest_dir_for_doc(doc, a, source)
         dest_dir.mkdir(parents=True, exist_ok=True)
         dest = dest_dir / source.name
-        shutil.copy2(source, dest)
+        from services.file_ops import safe_copy2, safe_unlink
+
+        if not safe_copy2(source, dest):
+            abort(500, "No se pudo copiar el archivo al destino")
         hash_firmado = _sha256(dest)
         try:
             dr = dest_root.resolve()
@@ -263,8 +294,11 @@ def _ingreso_copiar_a_destino_y_marcar(doc: dict, db, dispositivo: str) -> dict:
         documents.mark_signed(doc_id, dispositivo, dest, hash_firmado, rel)
         _mark_tango_firmado_si_aplica(g.db, doc)
         audit.record_ingreso_completado(doc, dispositivo, request.remote_addr, dest, hash_firmado, rel)
-        source.unlink()
+        if not safe_unlink(source):
+            logger.warning("BANDEJA_NO_BORRADA_TRAS_INGRESO | archivo=%s", source.name)
         logger.info("INGRESO_COMPLETADO | id=%s | archivo=%s", doc_id, doc["nombre"])
+        user_id = int((g.current_user or {}).get("sub") or 0) or None
+        _invalidate_firmados_cache(user_id)
         return {
             "ok": True,
             "archivo_firmado": rel,
@@ -378,26 +412,45 @@ def _resolve_dest_dir_for_doc(doc: dict, a, source: Path) -> Path:
         ruta=doc.get("ruta"),
         tango_fuente=doc.get("tango_fuente"),
     )
+    from services.path_settings import resolve_storage_path
+
     deposito_root = transferencias_segment_root(
-        Path(a.destino_path),
+        resolve_storage_path(a.destino_path),
         a,
         doc.get("tango_fuente"),
         ruta_pendiente=doc.get("ruta"),
     )
-    if a.modo_flujo == "ingreso":
-        texto = ingreso_routing.extract_pdf_text(source)
-        return ingreso_routing.destination_dir_ingresos(deposito_root, source.name, texto)
-    texto = transfer_routing.extract_pdf_text(source)
     keys = transfer_routing.parse_keywords_csv(getattr(a, "keywords_importante", "") or "")
     cats = parse_categorias_for_deposito(
         a, carpeta=carpeta, tango_fuente=doc.get("tango_fuente")
     )
+    if a.modo_flujo == "ingreso":
+        from services.metrics_ingresos import parse_ingreso_pdf
+
+        texto = ingreso_routing.extract_pdf_text(source)
+        parsed = parse_ingreso_pdf(source)
+        codigos = {
+            (it.codigo or "").strip().upper()
+            for it in (parsed.items or [])
+            if (it.codigo or "").strip()
+        }
+    else:
+        from services.metrics_transferencias import parse_transfer_pdf
+
+        texto = transfer_routing.extract_pdf_text(source)
+        parsed = parse_transfer_pdf(source)
+        codigos = {
+            (it.codigo or "").strip().upper()
+            for it in (parsed.items or [])
+            if (it.codigo or "").strip()
+        }
     return transfer_routing.destination_dir(
         deposito_root,
         source.name,
-        texto,
+        codigos,
         keywords_importante=keys or None,
         categorias=cats or None,
+        text_fallback=texto,
     )
 
 
@@ -412,8 +465,10 @@ def _finalize_archivo_pendiente(
     audit_fn,
 ) -> dict:
     """Marca firmado, auditoría, Tango y elimina el PDF de bandeja."""
+    from services.path_settings import resolve_storage_path
+
     hash_firmado = _sha256(dest)
-    root_dest = Path(a.destino_path)
+    root_dest = resolve_storage_path(a.destino_path)
     try:
         d_res = dest.resolve()
         rel = f"{a.prefijo}/" + str(d_res.relative_to(root_dest.resolve())).replace("\\", "/")
@@ -422,7 +477,15 @@ def _finalize_archivo_pendiente(
     documents.mark_signed(doc_id, dispositivo, dest, hash_firmado, rel)
     _mark_tango_firmado_si_aplica(g.db, doc)
     audit_fn(doc, dispositivo, request.remote_addr, dest, hash_firmado, rel)
-    source.unlink()
+    from services.file_ops import safe_unlink
+
+    if not safe_unlink(source):
+        logger.warning(
+            "BANDEJA_NO_BORRADA_TRAS_FIRMA | archivo=%s | se omitirá en próximo registro",
+            source.name,
+        )
+    user_id = int((g.current_user or {}).get("sub") or 0) or None
+    _invalidate_firmados_cache(user_id)
     return {"ok": True, "archivo_firmado": rel, "hash_firmado": hash_firmado}
 
 
@@ -506,7 +569,10 @@ def archivar_sin_firma(doc_id):
         dest_dir = _resolve_dest_dir_for_doc(doc, a, source)
         dest_dir.mkdir(parents=True, exist_ok=True)
         dest = dest_dir / source.name
-        shutil.copy2(source, dest)
+        from services.file_ops import safe_copy2
+
+        if not safe_copy2(source, dest):
+            abort(500, "No se pudo copiar el archivo al destino")
 
         out = _finalize_archivo_pendiente(
             doc_id,
@@ -642,72 +708,92 @@ def _collect_firmados_from_root(
 
 
 def _file_search_matches(ruta: Path, q: str) -> bool:
-    palabras = [p.lower() for p in q.split() if p]
-    if not palabras:
-        return True
-    name = ruta.name.lower()
-    if all(p in name for p in palabras):
-        return True
-    e = ruta.suffix.lower()
-    if e == ".pdf":
-        return _pdf_matches(ruta, q)
-    if e in (
-        ".txt",
-        ".csv",
-        ".log",
-        ".md",
-        ".json",
-        ".xml",
-        ".html",
-        ".htm",
-        ".yml",
-        ".yaml",
-        ".ini",
-        ".conf",
-        ".rc",
-    ):
-        try:
-            text = ruta.read_text(encoding="utf-8", errors="ignore")[:400_000].lower()
-            return all(p in text for p in palabras)
-        except OSError:
-            return False
-    return False
+    from services.file_search import file_search_matches
+
+    return file_search_matches(ruta, q)
 
 
-@app.route("/api/firmados")
-@require_auth("firmados:listar")
-def list_signed():
-    q = request.args.get("q", "").strip()
-    origen_f = (request.args.get("origen", "") or "").strip().lower()
-    tipo_f = (request.args.get("tipo", "") or "").strip().lower()
-    allowed = _effective_apartado_codes()
-    if not allowed:
-        return jsonify({"documentos": [], "total": 0})
-    try:
-        from models.apartado import Apartado
+def _require_reveal_location() -> None:
+    u = _current_db_user()
+    role = u.role.name if u and u.role else None
+    if not can_reveal_file_location(role):
+        abort(403, "Sin permiso para abrir ubicación de archivos")
 
-        aps = (
-            g.db.query(Apartado)
-            .filter(Apartado.activo.is_(True), Apartado.codigo.in_(allowed))
-            .order_by(Apartado.orden, Apartado.codigo)
-            .all()
-        )
-    except Exception as e:
-        logger.warning("LISTA_FIRMADOS_RUTA | %s", e)
-        abort(500, "Configuración de apartados no disponible")
-    try:
-        entries: list[tuple[Path, str, float, str, str, str]] = []
-        for a in aps:
-            root = Path(a.destino_path)
-            entries.extend(
-                _collect_firmados_from_root(root, a.codigo, a.prefijo)
+
+_FirmadosEntry = tuple[Path, str, float, str, str, str]
+
+_FIRMADOS_INDEX_CACHE: dict[tuple, tuple[float, list[_FirmadosEntry]]] = {}
+_FIRMADOS_INDEX_TTL_SEC = 50.0
+
+
+def _invalidate_firmados_cache(user_id: int | None = None) -> None:
+    """Borra índice en memoria tras firmar/archivar (evita listas obsoletas)."""
+    if not user_id:
+        _FIRMADOS_INDEX_CACHE.clear()
+        return
+    for key in list(_FIRMADOS_INDEX_CACHE):
+        if key[0] == user_id:
+            del _FIRMADOS_INDEX_CACHE[key]
+
+
+def _firmados_index_key(user_id: int, allowed: list[str]) -> tuple:
+    return (user_id, tuple(sorted(allowed)))
+
+
+def _scan_firmados_entries(aps) -> list[_FirmadosEntry]:
+    from services.path_settings import resolve_storage_path, scan_roots_for_apartado
+
+    entries: list[_FirmadosEntry] = []
+    seen_files: set[str] = set()
+    for a in aps:
+        scan_roots = scan_roots_for_apartado(a)
+        if not scan_roots:
+            logger.warning(
+                "LISTA_FIRMADOS_SIN_RUTAS | apartado=%s | destino=%s | bandeja=%s",
+                a.codigo,
+                a.destino_path,
+                a.bandeja_path,
             )
-    except OSError as e:
-        logger.warning("LISTA_FIRMADOS_ERROR | %s", e)
-        abort(500, "No se pudo leer las carpetas de firmados")
-
+            continue
+        for root in scan_roots:
+            if not root.is_dir():
+                logger.debug(
+                    "LISTA_FIRMADOS_ROOT_OMITIDO | apartado=%s | path=%s",
+                    a.codigo,
+                    root,
+                )
+                continue
+            for row in _collect_firmados_from_root(root, a.codigo, a.prefijo):
+                try:
+                    fkey = str(row[0].resolve())
+                except OSError:
+                    fkey = str(row[0])
+                if fkey in seen_files:
+                    continue
+                seen_files.add(fkey)
+                entries.append(row)
+    legacy = resolve_storage_path(Config.REMITOS_FIRMADOS)
+    if legacy.is_dir() and any(a.codigo == "transferencias" for a in aps):
+        for row in _collect_firmados_from_root(legacy, "transferencias", "t"):
+            try:
+                fkey = str(row[0].resolve())
+            except OSError:
+                fkey = str(row[0])
+            if fkey not in seen_files:
+                seen_files.add(fkey)
+                entries.append(row)
     entries.sort(key=lambda x: x[2], reverse=True)
-    items = []
+    return entries
+
+
+def _filter_firmados_entries(
+    entries: list[_FirmadosEntry],
+    *,
+    origen_f: str,
+    tipo_f: str,
+    q: str,
+) -> list[dict]:
+    items: list[dict] = []
     for ruta, rel, mt, orig, cat, ext in entries:
         if origen_f and origen_f not in ("todos", "all") and orig != origen_f:
             continue
@@ -724,6 +810,57 @@ def list_signed():
                 "extension": ext,
             }
         )
+    return items
+
+
+@app.route("/api/firmados")
+@require_auth("firmados:listar")
+def list_signed():
+    q = request.args.get("q", "").strip()
+    origen_f = (request.args.get("origen", "") or "").strip().lower()
+    tipo_f = (request.args.get("tipo", "") or "").strip().lower()
+    allowed = _effective_apartado_codes()
+    if not allowed:
+        return jsonify({"documentos": [], "total": 0})
+    user_id = int((g.current_user or {}).get("sub") or 0)
+    index_key = _firmados_index_key(user_id, allowed)
+    now = time.time()
+    fresh = request.args.get("fresh", "").strip().lower() in ("1", "true", "yes")
+    cached = _FIRMADOS_INDEX_CACHE.get(index_key)
+    try:
+        from models.apartado import Apartado
+
+        aps = (
+            g.db.query(Apartado)
+            .filter(Apartado.activo.is_(True), Apartado.codigo.in_(allowed))
+            .order_by(Apartado.orden, Apartado.codigo)
+            .all()
+        )
+    except Exception as e:
+        logger.warning("LISTA_FIRMADOS_RUTA | %s", e)
+        abort(500, "Configuración de apartados no disponible")
+    if not fresh and cached and now - cached[0] < _FIRMADOS_INDEX_TTL_SEC:
+        entries = cached[1]
+    else:
+        try:
+            entries = _scan_firmados_entries(aps)
+        except OSError as e:
+            logger.warning("LISTA_FIRMADOS_ERROR | %s", e)
+            abort(500, "No se pudo leer las carpetas de firmados")
+        _FIRMADOS_INDEX_CACHE[index_key] = (now, entries)
+        if not entries:
+            logger.info(
+                "LISTA_FIRMADOS_VACIA | usuario=%s | apartados=%s",
+                (g.current_user or {}).get("username"),
+                sorted(allowed),
+            )
+
+    items = _filter_firmados_entries(
+        entries,
+        origen_f=origen_f,
+        tipo_f=tipo_f,
+        q=q,
+    )
     return jsonify({"documentos": items, "total": len(items)})
 
 
@@ -916,6 +1053,7 @@ def get_signed_pdf():
 @app.route("/api/firmados/path")
 @require_auth("firmados:ver")
 def get_signed_path():
+    _require_reveal_location()
     nombre = request.args.get("n", "")
     a0 = _apartado_from_nombre_firmado(nombre)
     if a0 and a0.codigo not in _effective_apartado_codes():
@@ -927,16 +1065,23 @@ def get_signed_path():
     rel = ruta.name
     if a:
         try:
-            root = Path(a.destino_path).resolve()
+            from services.path_settings import resolve_storage_path
+
+            root = resolve_storage_path(a.destino_path)
             rel = f"{a.prefijo}/" + str(ruta.resolve().relative_to(root)).replace("\\", "/")
         except (ValueError, OSError):
             rel = f"{a.prefijo}/" + ruta.name
     return jsonify({
         "nombre": ruta.name,
         "ruta_relativa": rel,
-        "unc_folder": str(ruta.parent),
-        "unc_file": str(ruta),
+        **_signed_path_locations(ruta),
     })
+
+
+def _signed_path_locations(ruta: Path) -> dict[str, str]:
+    from services.client_paths import path_locations
+
+    return path_locations(ruta)
 
 def _normalize_windows_path_for_explorer(p: str) -> str:
     """
@@ -952,14 +1097,30 @@ def _normalize_windows_path_for_explorer(p: str) -> str:
     return p
 
 
+def _reveal_path_payload(ruta: Path, mode: str) -> dict[str, str | bool]:
+    """Rutas para el cliente (navegador). No abre el explorador en el servidor."""
+    locs = _signed_path_locations(ruta)
+    client_path = locs["client_file"] if mode == "select" else locs["client_folder"]
+    server_path = locs["server_file"] if mode == "select" else locs["server_folder"]
+    return {
+        "ok": True,
+        "opened_locally": False,
+        "client_path": client_path,
+        "client_kind": locs.get("client_kind", "posix"),
+        "server_path": server_path,
+        "path": client_path,
+        **locs,
+    }
+
+
 @app.route("/api/firmados/reveal")
 @require_auth("firmados:ver")
 def reveal_signed_in_explorer():
     """
-    Abre el Explorador de Windows en la carpeta del PDF firmado.
-    - mode=select  -> abre y selecciona el archivo
-    - mode=folder  -> abre la carpeta
+    Devuelve rutas para abrir/copiar desde el navegador del usuario.
+    No ejecuta explorer/xdg-open en el servidor (evita abrir en la PC del backend).
     """
+    _require_reveal_location()
     nombre = request.args.get("n", "")
     a0 = _apartado_from_nombre_firmado(nombre)
     if a0 and a0.codigo not in _effective_apartado_codes():
@@ -968,27 +1129,7 @@ def reveal_signed_in_explorer():
     ruta = _safe_signed_path(nombre, g.db)
     if not ruta:
         abort(404, "Archivo no encontrado")
-
-    if os.name != "nt":
-        abort(400, "Función disponible solo en Windows")
-
-    try:
-        unc_file = str(ruta.resolve())
-        unc_file = _normalize_windows_path_for_explorer(unc_file)
-        unc_folder = _normalize_windows_path_for_explorer(str(ruta.parent))
-
-        if mode == "folder":
-            cmd = f'explorer.exe "{unc_folder}"'
-        else:
-            # /select,PATH (en Windows suele requerir coma en el mismo argumento)
-            # Usamos shell=True para que Explorer reciba bien el quoting con rutas UNC.
-            cmd = f'explorer.exe /select,"{unc_file}"'
-
-        logger.info(f"EXPLORER_REVEAL | mode={mode} | cmd={cmd}")
-        subprocess.Popen(cmd, shell=True)
-        return jsonify({"ok": True})
-    except Exception as e:
-        abort(500, f"No se pudo abrir el Explorador: {e}")
+    return jsonify(_reveal_path_payload(ruta, mode))
 
 
 @app.route("/api/health")
@@ -1061,9 +1202,13 @@ def _safe_signed_path(nombre: str, db) -> Path | None:
     for p in rest:
         if p in (".", ""):
             return None
+    from services.path_settings import resolve_storage_path
+
     try:
-        base = Path(a.destino_path).resolve()
+        base = resolve_storage_path(a.destino_path)
     except Exception:
+        return None
+    if not base.is_dir():
         return None
     ruta = base.joinpath(*rest)
     try:

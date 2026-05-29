@@ -99,7 +99,7 @@ def categorias_from_json(raw: str | list | None) -> list[CategoriaConfig]:
         nombre = (str(it.get("nombre") or "")).strip()
         if not nombre or "/" in nombre or "\\" in nombre:
             continue
-        kw = (str(it.get("keywords") or "")).strip()
+        kw = (str(it.get("codigos_articulo") or it.get("keywords") or "")).strip()
         out.append(CategoriaConfig(nombre=nombre, keywords=kw))
     return out
 
@@ -163,7 +163,10 @@ def depositos_to_json(deps: list[DepositoConfig]) -> str:
         }
         if d.categorias:
             item["categorias"] = [
-                {"nombre": c.nombre, **({"keywords": c.keywords} if c.keywords else {})}
+                {
+                    "nombre": c.nombre,
+                    **({"codigos_articulo": c.keywords} if c.keywords else {}),
+                }
                 for c in d.categorias
             ]
         payload.append(item)
@@ -171,7 +174,10 @@ def depositos_to_json(deps: list[DepositoConfig]) -> str:
 
 
 def categorias_to_json(cats: list[CategoriaConfig]) -> str:
-    payload = [{"nombre": c.nombre, **({"keywords": c.keywords} if c.keywords else {})} for c in cats]
+    payload = [
+        {"nombre": c.nombre, **({"codigos_articulo": c.keywords} if c.keywords else {})}
+        for c in cats
+    ]
     return json.dumps(payload, ensure_ascii=False)
 
 
@@ -189,7 +195,7 @@ def _legacy_global_categorias(apartado: "Apartado") -> list[CategoriaConfig]:
     cats = categorias_from_json(getattr(apartado, "categorias_destino", None))
     if cats:
         return cats
-    if getattr(apartado, "modo_flujo", None) == "transferencia":
+    if getattr(apartado, "modo_flujo", None) in ("transferencia", "ingreso"):
         return default_categorias_transferencia(apartado)
     return []
 
@@ -197,7 +203,7 @@ def _legacy_global_categorias(apartado: "Apartado") -> list[CategoriaConfig]:
 def _enrich_depositos_categorias(
     apartado: "Apartado", deps: list[DepositoConfig]
 ) -> list[DepositoConfig]:
-    if getattr(apartado, "modo_flujo", None) != "transferencia":
+    if getattr(apartado, "modo_flujo", None) not in ("transferencia", "ingreso"):
         return deps
     fallback = tuple(_legacy_global_categorias(apartado))
     if not fallback:
@@ -223,7 +229,7 @@ def default_depositos_for_apartado(apartado: "Apartado") -> list[DepositoConfig]
     cod_raw = (getattr(apartado, "cod_deposito", None) or "2").strip()
     cods = _parse_cod_depositos(cod_raw) or ("2",)
     default_cats = ()
-    if getattr(apartado, "modo_flujo", None) == "transferencia":
+    if getattr(apartado, "modo_flujo", None) in ("transferencia", "ingreso"):
         default_cats = tuple(default_categorias_transferencia(apartado))
     out: list[DepositoConfig] = []
     for src in Config.tango_transferencia_sources():
@@ -263,7 +269,7 @@ def parse_categorias_for_deposito(
     tango_fuente: str | None = None,
 ) -> list[CategoriaConfig]:
     """Categorías del depósito indicado (por carpeta o fuente Tango)."""
-    if getattr(apartado, "modo_flujo", None) != "transferencia":
+    if getattr(apartado, "modo_flujo", None) not in ("transferencia", "ingreso"):
         return []
     dep = deposito_por_carpeta(apartado, carpeta) if carpeta else None
     if not dep and tango_fuente:
@@ -286,6 +292,44 @@ def bandeja_sin_firmar(bandeja_root: Path, carpeta: str) -> Path:
     d = Path(bandeja_root) / _safe_carpeta(carpeta) / SIN_FIRMAR
     d.mkdir(parents=True, exist_ok=True)
     return d
+
+
+def iter_bandeja_inbox_pdfs(apartado: "Apartado") -> list[Path]:
+    """
+    Solo PDFs bajo Sin Firmar (bandeja de pendientes).
+    No incluye firmados archivados en Importante/Regulares bajo el mismo árbol.
+    """
+    from services.path_settings import resolve_storage_path
+
+    band = resolve_storage_path(getattr(apartado, "bandeja_path", None))
+    if not band or not band.is_dir():
+        return []
+    out: list[Path] = []
+    if band.name.upper() == SIN_FIRMAR.upper():
+        for p in band.rglob("*.pdf"):
+            if p.is_file():
+                out.append(p)
+        return out
+    deps = parse_depositos(apartado)
+    if deps:
+        for dep in deps:
+            sf = bandeja_sin_firmar(band, dep.carpeta)
+            if not sf.is_dir():
+                continue
+            for p in sf.rglob("*.pdf"):
+                if p.is_file():
+                    out.append(p)
+        return out
+    for p in band.rglob("*.pdf"):
+        if not p.is_file():
+            continue
+        try:
+            rel = p.relative_to(band.resolve())
+        except (ValueError, OSError):
+            continue
+        if any(part.upper() == SIN_FIRMAR.upper() for part in rel.parts):
+            out.append(p)
+    return out
 
 
 def destino_deposito_root(destino_root: Path, carpeta: str) -> Path:
@@ -377,14 +421,14 @@ def validate_depositos_payload(data: Any, *, modo_flujo: str = "transferencia") 
         if d.tango_fuente in seen_fuentes:
             raise ValueError(f"tango_fuente duplicada: {d.tango_fuente}")
         seen_fuentes.add(d.tango_fuente)
-        if modo_flujo == "transferencia":
+        if modo_flujo in ("transferencia", "ingreso"):
             _validate_categorias_list(list(d.categorias), context=f"{d.carpeta}: ")
     return deps
 
 
 def validate_categorias_payload(data: Any, *, modo_flujo: str) -> list[CategoriaConfig]:
     """Legacy: categorías globales (se copian a cada depósito si hace falta)."""
-    if modo_flujo != "transferencia":
+    if modo_flujo not in ("transferencia", "ingreso"):
         return []
     if not isinstance(data, list) or len(data) < 1:
         raise ValueError("categorias_destino debe ser una lista con al menos una categoría")

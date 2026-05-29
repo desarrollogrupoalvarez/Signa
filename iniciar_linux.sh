@@ -13,7 +13,7 @@ source "$VENV/bin/activate"
 
 pip install -q -r backend/requirements.txt
 
-mkdir -p datos/Bandeja_Entrada datos/Remitos_Firmados logs
+mkdir -p datos/Bandeja_Entrada datos/Remitos_Firmados datos/Transferencias datos/Bandeja_Ingresos datos/Ingresos logs
 [ -f .env ] || cp .env.example .env
 
 echo ""

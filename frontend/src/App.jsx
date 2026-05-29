@@ -2,7 +2,6 @@
 import { toast } from 'sonner'
 import { apiFetch } from './api/client'
 import Header from './components/Header'
-import LoadingOverlay from './components/LoadingOverlay'
 import AdminPage from './components/AdminPage'
 import LoginPage from './components/LoginPage'
 import NoPermissionScreen from './components/NoPermissionScreen'
@@ -15,9 +14,37 @@ import { useCroppedSignature } from './hooks/useCroppedSignature'
 import { useIsMobile } from './hooks/useIsMobile'
 import { useDebounce } from './hooks/useDebounce'
 import { displayPendingNombre } from './utils/displayDocName.js'
+import { filterPendingForUser, normListUsername } from './utils/pendingListForUser.js'
+import { markTangoSynced, shouldSkipTangoSync, tangoSyncCacheKey } from './utils/tangoSyncCache.js'
+import { upscaleSignatureForPlacement } from './utils/signatureExport.js'
 
 const POLL_INTERVAL = 8000
+const SIGNED_POLL_INTERVAL = 15000
 const _PERM_REQUIRED = 'Permiso requerido:'
+
+function signedRowKey(d) {
+  return `${d?.origen || ''}::${d?.nombre || ''}`
+}
+
+function mergeSignedWithOptimistic(serverDocs, prevDocs) {
+  const keys = new Set((serverDocs || []).map(signedRowKey))
+  const extra = (prevDocs || []).filter((d) => !keys.has(signedRowKey(d)))
+  return [...extra, ...(serverDocs || [])]
+}
+
+function optimisticSignedFromArchivo(archivoFirmado, apartadoCodigo) {
+  const nombre = (archivoFirmado || '').trim()
+  if (!nombre) return null
+  const ext = nombre.includes('.') ? nombre.slice(nombre.lastIndexOf('.')) : '.pdf'
+  const origen = (apartadoCodigo || '').trim() || 'transferencias'
+  return {
+    nombre,
+    origen,
+    modificado_en: new Date().toISOString(),
+    categoria: 'pdf',
+    extension: ext.toLowerCase(),
+  }
+}
 
 function pickDefaultTab(perms = [], { mobileIngresosOnly = false, apartados = [] } = {}) {
   const aps = apartados || []
@@ -39,28 +66,40 @@ function pickDefaultTab(perms = [], { mobileIngresosOnly = false, apartados = []
   return 'firmados'
 }
 
+function todayBuenosAires() {
+  return new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'America/Argentina/Buenos_Aires',
+  }).format(new Date())
+}
+
 export default function App() {
   const [token, setToken] = useState(() => localStorage.getItem('rf_token'))
   const [activeTab, setActiveTab] = useState('pendientes')
   const [documents, setDocuments] = useState([])
+  /** Incrementa en cada login/logout; invalida listas y respuestas HTTP tardías. */
+  const [listSession, setListSession] = useState(0)
+  const [documentsListSession, setDocumentsListSession] = useState(-1)
   const [signedDocs, setSignedDocs] = useState([])
+  const [signedListSession, setSignedListSession] = useState(-1)
   const [signedQInput, setSignedQInput] = useState('')
+  const [pendingQInput, setPendingQInput] = useState('')
   const [signedOrigen, setSignedOrigen] = useState('todos')
-  const signedQDeb = useDebounce(signedQInput, 400)
+  const signedQDeb = useDebounce(signedQInput, 400, listSession)
+  const pendingQDeb = useDebounce(pendingQInput, 400, listSession)
   const [selectedDoc, setSelectedDoc] = useState(null)
   const [connected, setConnected] = useState(false)
   const [currentUser, setCurrentUser] = useState(null)
   const [adminSection, setAdminSection] = useState('rutas')
   const [metricsDocs, setMetricsDocs] = useState([])
   const [activeApartadoCodigo, setActiveApartadoCodigo] = useState('')
-  const [syncFecha, setSyncFecha] = useState(() => new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Argentina/Buenos_Aires' }).format(new Date()))
+  const [syncFecha, setSyncFecha] = useState(() => todayBuenosAires())
   const [syncingTango, setSyncingTango] = useState(false)
   const [refreshingSigned, setRefreshingSigned] = useState(false)
   const [refreshingMetrics, setRefreshingMetrics] = useState(false)
 
   const [noPermission, setNoPermission] = useState(false)
   const [noPermissionDetail, setNoPermissionDetail] = useState('')
-  const [loadingMsg, setLoadingMsg] = useState(null)
+  const [listBootLoading, setListBootLoading] = useState(false)
 
   const [rawSignature, setRawSignature] = useState(null)
   const [placement, setPlacement] = useState(null)
@@ -70,8 +109,84 @@ export default function App() {
 
   const croppedFirma = useCroppedSignature(rawSignature)
   const pollRef = useRef(null)
+  const signedPollRef = useRef(null)
   const metricsPageRef = useRef(null)
+  /** Incrementar al cambiar de usuario para ignorar respuestas HTTP tardías del usuario anterior. */
+  const documentsFetchIdRef = useRef(0)
+  const signedFetchIdRef = useRef(0)
+  const documentsAbortRef = useRef(null)
+  const signedAbortRef = useRef(null)
+  const currentUserRef = useRef(null)
+  const fetchDocumentsRef = useRef(() => {})
+  const fetchSignedRef = useRef(() => {})
+  const listSessionRef = useRef(0)
+  const shouldBootstrapRef = useRef(false)
+  const listBootLoadingRef = useRef(false)
+  const activeTabRef = useRef(activeTab)
+  const skipNextPollFetchRef = useRef(false)
+  const signedPrefetchDoneRef = useRef(false)
   const isMobile = useIsMobile()
+
+  useEffect(() => {
+    currentUserRef.current = currentUser
+  }, [currentUser])
+
+  useEffect(() => {
+    activeTabRef.current = activeTab
+  }, [activeTab])
+
+  function invalidatePendingFetches() {
+    documentsFetchIdRef.current += 1
+    signedFetchIdRef.current += 1
+    documentsAbortRef.current?.abort()
+    documentsAbortRef.current = null
+    signedAbortRef.current?.abort()
+    signedAbortRef.current = null
+  }
+
+  function bumpListSession() {
+    listSessionRef.current += 1
+    const next = listSessionRef.current
+    setListSession(next)
+    setDocuments([])
+    setDocumentsListSession(-1)
+    setSignedDocs([])
+    setSignedListSession(-1)
+    signedPrefetchDoneRef.current = false
+  }
+
+  /** Limpia todo estado de UI vinculado al usuario anterior (logout o antes de login nuevo). */
+  function resetSessionState() {
+    invalidatePendingFetches()
+    if (pollRef.current) {
+      clearInterval(pollRef.current)
+      pollRef.current = null
+    }
+    if (signedPollRef.current) {
+      clearInterval(signedPollRef.current)
+      signedPollRef.current = null
+    }
+    bumpListSession()
+    setSelectedDoc(null)
+    setSignedQInput('')
+    setPendingQInput('')
+    setSignedOrigen('todos')
+    setMetricsDocs([])
+    setActiveApartadoCodigo('')
+    setSyncFecha(todayBuenosAires())
+    setAdminSection('rutas')
+    setNoPermission(false)
+    setNoPermissionDetail('')
+    setConnected(false)
+    setSyncingTango(false)
+    setRefreshingSigned(false)
+    setRefreshingMetrics(false)
+    setListBootLoading(false)
+    listBootLoadingRef.current = false
+    skipNextPollFetchRef.current = false
+    signedPrefetchDoneRef.current = false
+    resetSignature()
+  }
 
   const permissions = currentUser?.permissions || []
   const apartados = currentUser?.apartados || []
@@ -116,41 +231,41 @@ export default function App() {
     ? pickDefaultTab(permissions, { mobileIngresosOnly: onlyMobileIngresos, apartados })
     : 'pendientes'
 
+  const documentsForUser =
+    documentsListSession === listSession ? documents : []
+
   const mobileIngresoDocs = useMemo(
-    () => documents.filter((d) => d.modo_flujo === 'ingreso'),
-    [documents],
+    () => documentsForUser.filter((d) => d.modo_flujo === 'ingreso'),
+    [documentsForUser],
   )
 
   const documentsForActiveDesktop = useMemo(() => {
-    const base = onlyMobileIngresos ? [] : documents
+    const base = onlyMobileIngresos ? [] : documentsForUser
     if (!activeApartadoCodigo) return base
     return base.filter((d) => d.apartado_codigo === activeApartadoCodigo)
-  }, [documents, onlyMobileIngresos, activeApartadoCodigo])
+  }, [documentsForUser, onlyMobileIngresos, activeApartadoCodigo])
+
+  const signedDocsForUser = signedListSession === listSession ? signedDocs : []
 
   // â”€â”€ Auth â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   function handleLogin(data) {
+    localStorage.setItem('rf_token', data.token)
+    resetSessionState()
     setToken(data.token)
     setCurrentUser(data.user || null)
+    currentUserRef.current = data.user || null
     const mobile = typeof window !== 'undefined' && window.matchMedia('(max-width: 640px)').matches
     setActiveTab(pickDefaultTab(data.user?.permissions || [], { mobileIngresosOnly: mobile, apartados: data.user?.apartados || [] }))
-    setSelectedDoc(null)
-    setSignedDocs([])
-    setSignedQInput('')
-    setSignedOrigen('todos')
-    resetSignature()
+    shouldBootstrapRef.current = true
   }
 
   function handleLogout() {
     localStorage.removeItem('rf_token')
+    resetSessionState()
     setToken(null)
     setCurrentUser(null)
+    currentUserRef.current = null
     setActiveTab('pendientes')
-    setSelectedDoc(null)
-    setSignedDocs([])
-    setSignedQInput('')
-    setSignedOrigen('todos')
-    resetSignature()
-    if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null }
   }
 
   const handlePermissionError = useCallback(
@@ -175,145 +290,360 @@ export default function App() {
     [defaultTab],
   ) // eslint-disable-line react-hooks/exhaustive-deps
 
-  const fetchDocuments = useCallback(async () => {
+  const fetchDocuments = useCallback(async (opts = {}) => {
+    const { silent = false } = opts
+    const user = currentUserRef.current
+    const sessionUser = normListUsername(user?.username)
+    if (!sessionUser) return
+    const listGen = listSessionRef.current
+    const fetchId = documentsFetchIdRef.current
+    documentsAbortRef.current?.abort()
+    const ac = new AbortController()
+    documentsAbortRef.current = ac
     try {
       const sp = new URLSearchParams()
       if (syncFecha) sp.set('fecha', syncFecha)
+      const pq = (pendingQDeb || '').trim()
+      if (pq) sp.set('q', pq)
+      sp.set('_', String(Date.now()))
       const qs = sp.toString()
       const path = '/api/documentos' + (qs ? `?${qs}` : '')
-      const res = await apiFetch(path)
+      const res = await apiFetch(path, { signal: ac.signal })
       const { documentos } = await res.json()
-      setDocuments(documentos)
+      if (fetchId !== documentsFetchIdRef.current) return
+      if (listGen !== listSessionRef.current) return
+      if (sessionUser !== normListUsername(currentUserRef.current?.username)) return
+      const filtered = filterPendingForUser(documentos, user)
+      setDocuments(filtered)
+      setDocumentsListSession(listGen)
       setConnected(true)
     } catch (e) {
+      if (e?.name === 'AbortError') return
+      if (fetchId !== documentsFetchIdRef.current) return
+      if (listGen !== listSessionRef.current) return
+      if (sessionUser !== normListUsername(currentUserRef.current?.username)) return
       if (e.status === 401 || e.status === 403) handlePermissionError(e.detail)
       else setConnected(false)
+    } finally {
+      if (documentsAbortRef.current === ac) documentsAbortRef.current = null
     }
-  }, [handlePermissionError, syncFecha])
+  }, [handlePermissionError, syncFecha, pendingQDeb])
 
+  fetchDocumentsRef.current = fetchDocuments
+
+  const resolveApartadoCodigoForSync = useCallback(() => {
+    if (onlyMobileIngresos) return ingresoAps[0]?.codigo || ''
+    return (
+      transferenciaAps.find((a) => a.codigo === activeApartadoCodigo)?.codigo ||
+      transferenciaAps[0]?.codigo ||
+      ''
+    )
+  }, [onlyMobileIngresos, ingresoAps, transferenciaAps, activeApartadoCodigo])
+
+  const showTangoSyncToasts = useCallback((data) => {
+    const nGen = (data.generados || []).length
+    const nReg = (data.registrados || []).length
+    const omitB = (data.omitidos_en_bandeja || []).length
+    const omitF = (data.omitidos_ya_firmados || []).length
+    const omitNR = (data.omitidos_sin_registro || []).length
+    const filas = data.filas_tango ?? 0
+    const comps = data.comprobantes_detectados ?? 0
+    const errs = data.errores || []
+    const porFuente = data.generados_por_fuente || {}
+    const fuenteTxt = Object.entries(porFuente)
+      .map(([k, arr]) => `${k}: ${(arr || []).length}`)
+      .join(', ')
+    if (errs.length) toast.error(errs.join('; '))
+    else if (nGen) {
+      const extra = fuenteTxt ? ` (${fuenteTxt})` : ''
+      const regTxt = nReg ? `, ${nReg} en lista` : ''
+      const skipTxt = omitNR ? `, ${omitNR} no registrados` : ''
+      toast.success(
+        `Tango: ${nGen} PDF(s) nuevos${regTxt}${skipTxt} (${comps} comprobante(s) en Tango, ${filas} línea(s))${extra}`,
+      )
+    } else if (comps > 0) {
+      const extra = fuenteTxt ? ` — ${fuenteTxt}` : ''
+      const regTxt = nReg ? `, ${nReg} en lista` : ''
+      const skipTxt = omitNR ? `, ${omitNR} no registrados` : ''
+      toast.success(
+        `Sin PDFs nuevos: ${comps} comprobante(s) en Tango (${omitB} ya en bandeja${regTxt}, ${omitF} ya firmados${skipTxt})${extra}`,
+      )
+    } else {
+      const filasPf = data.filas_tango_por_fuente || {}
+      const det = Object.entries(filasPf)
+        .map(([k, v]) => `${k}: ${v} filas`)
+        .join(', ')
+      const extra = det ? ` (${det})` : ''
+      toast.success(
+        `Tango: 0 comprobantes para esa fecha (usuarios: ${(data.usuarios_consultados || []).join(', ') || '—'})${extra}`,
+      )
+    }
+  }, [])
+
+  const syncTangoAndRefresh = useCallback(
+    async ({ showToasts = true, force = false } = {}) => {
+      const codigo = resolveApartadoCodigoForSync()
+      if (!codigo) {
+        if (showToasts) toast.error('Seleccioná un apartado')
+        await fetchDocuments({ silent: true })
+        return { skipped: true }
+      }
+      const user = normListUsername(currentUserRef.current?.username)
+      const cacheKey = tangoSyncCacheKey(user, codigo, syncFecha)
+      if (!force && shouldSkipTangoSync(cacheKey)) {
+        await fetchDocuments({ silent: true })
+        if (showToasts) {
+          toast.message('Lista actualizada (Tango ya sincronizado hace poco)')
+        }
+        return { skipped: true, cached: true }
+      }
+      try {
+        const res = await apiFetch(`/api/apartados/${encodeURIComponent(codigo)}/sincronizar-tango`, {
+          method: 'POST',
+          body: JSON.stringify({ fecha: syncFecha }),
+        })
+        const data = await res.json()
+        markTangoSynced(cacheKey)
+        if (showToasts) showTangoSyncToasts(data)
+      } catch (e) {
+        if (e.status === 401 || e.status === 403) {
+          handlePermissionError(e.detail)
+          throw e
+        }
+        if (showToasts) toast.error(e.message || 'Error al sincronizar con Tango')
+      }
+      await fetchDocuments({ silent: true })
+      return { skipped: false }
+    },
+    [resolveApartadoCodigoForSync, syncFecha, fetchDocuments, showTangoSyncToasts, handlePermissionError],
+  )
 
   const syncTango = useCallback(async () => {
-    const codigo = onlyMobileIngresos
-      ? ingresoAps[0]?.codigo
-      : transferenciaAps.find((a) => a.codigo === activeApartadoCodigo)?.codigo ||
-        transferenciaAps[0]?.codigo
-    if (!codigo) {
-      toast.error('SeleccionÃ¡ un apartado')
-      return
-    }
     setSyncingTango(true)
     try {
-      const res = await apiFetch(`/api/apartados/${encodeURIComponent(codigo)}/sincronizar-tango`, {
-        method: 'POST',
-        body: JSON.stringify({ fecha: syncFecha }),
-      })
-      const data = await res.json()
-      const n = (data.generados || []).length
-      const omitB = (data.omitidos_en_bandeja || []).length
-      const omitF = (data.omitidos_ya_firmados || []).length
-      const filas = data.filas_tango ?? 0
-      const comps = data.comprobantes_detectados ?? 0
-      const errs = data.errores || []
-      const porFuente = data.generados_por_fuente || {}
-      const fuenteTxt = Object.entries(porFuente)
-        .map(([k, arr]) => `${k}: ${(arr || []).length}`)
-        .join(', ')
-      if (errs.length) toast.error(errs.join('; '))
-      else if (n) {
-        const extra = fuenteTxt ? ` (${fuenteTxt})` : ''
-        toast.success(`Tango: ${n} PDF(s) nuevos (${comps} comprobante(s), ${filas} línea(s))${extra}`)
-      } else if (comps > 0) {
-        const extra = fuenteTxt ? ` — ${fuenteTxt}` : ''
-        toast.success(`Sin PDFs nuevos: ${comps} comprobante(s) en Tango (${omitB} en bandeja, ${omitF} ya firmados)${extra}`)
-      } else {
-        const filasPf = data.filas_tango_por_fuente || {}
-        const det = Object.entries(filasPf)
-          .map(([k, v]) => `${k}: ${v} filas`)
-          .join(', ')
-        const extra = det ? ` (${det})` : ''
-        toast.success(
-          `Tango: 0 comprobantes para esa fecha (usuarios: ${(data.usuarios_consultados || []).join(', ') || '—'})${extra}`,
-        )
-      }
-      await fetchDocuments()
-    } catch (e) {
-      toast.error(e.message || 'Error al sincronizar con Tango')
+      await syncTangoAndRefresh({ showToasts: true, force: true })
     } finally {
       setSyncingTango(false)
     }
-  }, [activeApartadoCodigo, apartados, ingresoAps, onlyMobileIngresos, transferenciaAps, syncFecha, fetchDocuments])
+  }, [syncTangoAndRefresh])
 
-  const fetchSigned = useCallback(async () => {
-    setRefreshingSigned(true)
+  const fetchSigned = useCallback(async (opts = {}) => {
+    const { silent = false, fresh = false, mergeOptimistic = false } = opts
+    const sessionUser = normListUsername(currentUserRef.current?.username)
+    if (!sessionUser) return
+    const listGen = listSessionRef.current
+    const fetchId = signedFetchIdRef.current
+    signedAbortRef.current?.abort()
+    const ac = new AbortController()
+    signedAbortRef.current = ac
+    if (!silent) setRefreshingSigned(true)
     try {
       const sp = new URLSearchParams()
       const q = (signedQDeb || '').trim()
       if (q) sp.set('q', q)
       if (signedOrigen && signedOrigen !== 'todos') sp.set('origen', signedOrigen)
+      if (fresh) sp.set('fresh', '1')
+      sp.set('_', String(Date.now()))
       const qs = sp.toString()
       const path = '/api/firmados' + (qs ? `?${qs}` : '')
-      const res = await apiFetch(path)
+      const res = await apiFetch(path, { signal: ac.signal })
       const { documentos } = await res.json()
-      setSignedDocs(documentos)
+      if (fetchId !== signedFetchIdRef.current) return
+      if (listGen !== listSessionRef.current) return
+      if (sessionUser !== normListUsername(currentUserRef.current?.username)) return
+      setSignedDocs((prev) =>
+        mergeOptimistic ? mergeSignedWithOptimistic(documentos, prev) : documentos,
+      )
+      setSignedListSession(listGen)
       setConnected(true)
     } catch (e) {
+      if (e?.name === 'AbortError') return
+      if (fetchId !== signedFetchIdRef.current) return
+      if (listGen !== listSessionRef.current) return
+      if (sessionUser !== normListUsername(currentUserRef.current?.username)) return
       if (e.status === 401 || e.status === 403) handlePermissionError(e.detail)
       else {
         setConnected(false)
-        toast.error('No se pudo cargar firmados: ' + e.message)
+        if (!silent) toast.error('No se pudo cargar firmados: ' + e.message)
       }
     } finally {
-      setRefreshingSigned(false)
+      if (signedAbortRef.current === ac) signedAbortRef.current = null
+      if (!silent && fetchId === signedFetchIdRef.current) setRefreshingSigned(false)
     }
   }, [handlePermissionError, signedQDeb, signedOrigen])
 
+  const bootstrapSessionAfterAuth = useCallback(async () => {
+    const user = currentUserRef.current
+    if (!user) return
+    const bootGen = listSessionRef.current
+    listBootLoadingRef.current = true
+    setListBootLoading(true)
+    try {
+      const perms = user.permissions || []
+      const canListPending = perms.includes('documentos:listar')
+      const canListSigned = perms.includes('firmados:listar')
+      const bootTab = activeTabRef.current
+
+      if (!canListPending && !canListSigned) return
+
+      if (canListPending) {
+        await fetchDocuments({ silent: true })
+      } else if (canListSigned && bootTab === 'firmados') {
+        await fetchSigned({ silent: true, mergeOptimistic: false })
+      }
+    } catch (e) {
+      if (e?.status === 401 || e?.status === 403) return
+      if (bootGen === listSessionRef.current) {
+        const perms = user.permissions || []
+        if (perms.includes('documentos:listar')) {
+          try {
+            await fetchDocuments({ silent: true })
+          } catch {
+            /* ignore */
+          }
+        }
+      }
+    } finally {
+      if (bootGen === listSessionRef.current) {
+        skipNextPollFetchRef.current = true
+        listBootLoadingRef.current = false
+        setListBootLoading(false)
+      }
+    }
+  }, [fetchDocuments, fetchSigned])
+
+  fetchSignedRef.current = fetchSigned
+
+  const applyOptimisticSigned = useCallback((archivoFirmado, apartadoCodigo) => {
+    const row = optimisticSignedFromArchivo(archivoFirmado, apartadoCodigo)
+    if (!row) return
+    const listGen = listSessionRef.current
+    const rowKey = signedRowKey(row)
+    setSignedDocs((prev) => {
+      const rest = prev.filter((d) => signedRowKey(d) !== rowKey)
+      return [row, ...rest]
+    })
+    setSignedListSession(listGen)
+  }, [])
+
+  /** Refresca pendientes y digitalizados sin bloquear la UI (p. ej. tras firmar). */
+  const refreshListsAfterPendingChange = useCallback(() => {
+    const perms = currentUserRef.current?.permissions || []
+    const tasks = [fetchDocuments({ silent: true })]
+    if (perms.includes('firmados:listar')) {
+      tasks.push(fetchSigned({ silent: true, fresh: true, mergeOptimistic: true }))
+    }
+    void Promise.all(tasks).catch(() => {})
+  }, [fetchDocuments, fetchSigned])
+
   const listRefreshLoading =
-    activeTab === 'firmados' ? refreshingSigned : activeTab === 'metricas' ? refreshingMetrics : false
+    activeTab === 'firmados'
+      ? refreshingSigned
+      : activeTab === 'metricas'
+        ? refreshingMetrics
+        : false
+
+  const canRevealLocation =
+    currentUser?.role === 'superadmin' || currentUser?.role === 'administrador'
 
   function handleListRefresh() {
-    if (activeTab === 'firmados') fetchSigned()
-    else if (activeTab === 'metricas') metricsPageRef.current?.refresh()
+    if (activeTab === 'firmados') {
+      fetchSigned({ silent: false, fresh: true, mergeOptimistic: false })
+    } else if (activeTab === 'metricas') metricsPageRef.current?.refresh()
   }
 
   useEffect(() => {
-    if (activeTab !== 'firmados') return
-    fetchSigned()
-  }, [activeTab, fetchSigned])
-
-  useEffect(() => {
-    if (activeTab === 'admin') {
-      if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null }
-      return
-    }
-    fetchDocuments()
-    if (pollRef.current) clearInterval(pollRef.current)
-    pollRef.current = setInterval(fetchDocuments, POLL_INTERVAL)
-    return () => { if (pollRef.current) { clearInterval(pollRef.current) } }
-  }, [fetchDocuments, activeTab])
-
-  useEffect(() => {
     if (!token) return
+    let cancelled = false
     ;(async () => {
+      const meFetchId = documentsFetchIdRef.current
       try {
         const res = await apiFetch('/api/auth/me')
         const me = await res.json()
+        if (cancelled || meFetchId !== documentsFetchIdRef.current) return
+        const wasBootstrap = !currentUserRef.current
         setCurrentUser(me)
-        // En mÃ³vil, si el usuario tiene ingresos, fijar "Pendientes" como vista principal.
+        currentUserRef.current = me
         const mobile = typeof window !== 'undefined' && window.matchMedia('(max-width: 640px)').matches
         const perms = me?.permissions || []
         const aps = me?.apartados || []
         const ingresoCount = aps.filter((a) => a?.modo_flujo === 'ingreso').length
         const mobileIngresosOnly = mobile && perms.includes('documentos:listar') && ingresoCount > 0
         setActiveTab(pickDefaultTab(perms, { mobileIngresosOnly, apartados: aps }))
+        if (wasBootstrap) {
+          shouldBootstrapRef.current = true
+        }
       } catch (e) {
         if (e.status === 401) handleLogout()
       }
     })()
-  }, [token])
+    return () => {
+      cancelled = true
+    }
+  }, [token]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    if (!token || !currentUser) return
+    if (!shouldBootstrapRef.current) return
+    shouldBootstrapRef.current = false
+    void bootstrapSessionAfterAuth()
+  }, [token, currentUser?.id, listSession, bootstrapSessionAfterAuth])
+
+  useEffect(() => {
+    if (!token || !currentUser || listBootLoading || !canFirmados) return
+    if (activeTab !== 'firmados') {
+      if (signedPollRef.current) {
+        clearInterval(signedPollRef.current)
+        signedPollRef.current = null
+      }
+      return
+    }
+    fetchSigned({ silent: true })
+    if (signedPollRef.current) clearInterval(signedPollRef.current)
+    signedPollRef.current = setInterval(
+      () => fetchSigned({ silent: true }),
+      SIGNED_POLL_INTERVAL,
+    )
+    return () => {
+      if (signedPollRef.current) {
+        clearInterval(signedPollRef.current)
+        signedPollRef.current = null
+      }
+    }
+  }, [activeTab, fetchSigned, token, currentUser, listBootLoading, canFirmados])
+
+  useEffect(() => {
+    if (!token || !currentUser || listBootLoading || !canFirmados) return
+    if (activeTab !== 'pendientes') return
+    if (signedPrefetchDoneRef.current) return
+    signedPrefetchDoneRef.current = true
+    fetchSigned({ silent: true })
+  }, [activeTab, token, currentUser, listBootLoading, canFirmados, fetchSigned])
+
+  useEffect(() => {
+    if (!token || !currentUser || listBootLoading) return
+    if (activeTab === 'admin') {
+      if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null }
+      return
+    }
+    if (skipNextPollFetchRef.current) {
+      skipNextPollFetchRef.current = false
+    } else {
+      fetchDocuments({ silent: true })
+    }
+    if (pollRef.current) clearInterval(pollRef.current)
+    pollRef.current = setInterval(() => fetchDocuments({ silent: true }), POLL_INTERVAL)
+    return () => {
+      if (pollRef.current) {
+        clearInterval(pollRef.current)
+        pollRef.current = null
+      }
+    }
+  }, [fetchDocuments, activeTab, token, currentUser, listBootLoading])
 
   useEffect(() => {
     if (selectedDoc?.tipo === 'pendiente') {
-      const still = documents.find((d) => d.id === selectedDoc.id)
+      const still = documentsForUser.find((d) => d.id === selectedDoc.id)
       if (!still) {
         setSelectedDoc(null)
         resetSignature()
@@ -359,14 +689,14 @@ export default function App() {
       if (!canFirmados) return
       if (selectedDoc?.tipo === 'pendiente') { setSelectedDoc(null); resetSignature() }
       setActiveTab('firmados')
-      fetchSigned()
+      if (signedListSession !== listSession) fetchSigned({ silent: true })
       return
     }
     if (tab === 'pendientes') {
       if (!canPendientes) return
       if (selectedDoc?.tipo === 'firmado') setSelectedDoc(null)
       setActiveTab('pendientes')
-      fetchDocuments()
+      if (documentsListSession !== listSession) fetchDocuments({ silent: true })
     }
   }
 
@@ -381,27 +711,45 @@ export default function App() {
 
   async function handleSign() {
     if (!selectedDoc || !croppedFirma || !placement) return
-    setLoadingMsg('Guardando firma…')
+    const doc = selectedDoc
+    const docId = doc.id
+    const signedApartado = doc.apartado_codigo
+    const nombreToast = displayPendingNombre(doc)
     try {
       const dispositivo = `${navigator.userAgent.slice(0, 80)} | ${new Date().toISOString()}`
-      await apiFetch(`/api/documentos/${selectedDoc.id}/firmar`, {
+      const firmaPayload = await upscaleSignatureForPlacement({
+        dataURL: croppedFirma.dataURL,
+        aspect: croppedFirma.aspect,
+        placement: {
+          x: placement.x,
+          y: placement.y,
+          w: placement.w,
+          h: placement.h,
+        },
+      })
+      const res = await apiFetch(`/api/documentos/${docId}/firmar`, {
         method: 'POST',
         body: JSON.stringify({
-          firma: croppedFirma.dataURL,
+          firma: firmaPayload,
           dispositivo,
           page: placement.page,
           placement: { x: placement.x, y: placement.y, w: placement.w, h: placement.h },
         }),
       })
-      toast.success(`"${displayPendingNombre(selectedDoc)}" guardado correctamente`)
+      const data = await res.json()
+      if (currentUserRef.current?.permissions?.includes('firmados:listar')) {
+        applyOptimisticSigned(data.archivo_firmado, signedApartado)
+      }
+      const listGen = listSessionRef.current
+      setDocuments((prev) => prev.filter((d) => d.id !== docId))
+      setDocumentsListSession(listGen)
+      toast.success(`"${nombreToast}" guardado correctamente`)
       setSelectedDoc(null)
       resetSignature()
-      fetchDocuments()
+      refreshListsAfterPendingChange()
     } catch (e) {
       if (e.status === 401 || e.status === 403) handlePermissionError(e.detail)
       else toast.error('Error al guardar: ' + e.message)
-    } finally {
-      setLoadingMsg(null)
     }
   }
 
@@ -414,22 +762,30 @@ export default function App() {
     ) {
       return
     }
-    setLoadingMsg('Archivando…')
+    const doc = selectedDoc
+    const docId = doc.id
+    const signedApartado = doc.apartado_codigo
+    const nombreToast = displayPendingNombre(doc)
     try {
       const dispositivo = `${navigator.userAgent.slice(0, 80)} | ${new Date().toISOString()}`
-      await apiFetch(`/api/documentos/${selectedDoc.id}/archivar_sin_firma`, {
+      const res = await apiFetch(`/api/documentos/${docId}/archivar_sin_firma`, {
         method: 'POST',
         body: JSON.stringify({ dispositivo }),
       })
-      toast.success(`"${displayPendingNombre(selectedDoc)}" archivado correctamente`)
+      const data = await res.json()
+      if (currentUserRef.current?.permissions?.includes('firmados:listar')) {
+        applyOptimisticSigned(data.archivo_firmado, signedApartado)
+      }
+      const listGen = listSessionRef.current
+      setDocuments((prev) => prev.filter((d) => d.id !== docId))
+      setDocumentsListSession(listGen)
+      toast.success(`"${nombreToast}" archivado correctamente`)
       setSelectedDoc(null)
       resetSignature()
-      fetchDocuments()
+      refreshListsAfterPendingChange()
     } catch (e) {
       if (e.status === 401 || e.status === 403) handlePermissionError(e.detail)
       else toast.error('Error al archivar: ' + e.message)
-    } finally {
-      setLoadingMsg(null)
     }
   }
 
@@ -440,7 +796,9 @@ export default function App() {
       setConnected(true)
       if (activeTab === 'firmados') await fetchSigned()
       else await fetchDocuments()
-      if (!pollRef.current) pollRef.current = setInterval(fetchDocuments, POLL_INTERVAL)
+      if (!pollRef.current) {
+        pollRef.current = setInterval(() => fetchDocuments({ silent: true }), POLL_INTERVAL)
+      }
     } catch (e) {
       if (e.status === 401 || e.status === 403) handlePermissionError(e.detail)
       else setConnected(false)
@@ -499,10 +857,10 @@ export default function App() {
 
   return (
     <>
-      <LoadingOverlay msg={loadingMsg} />
       <NoPermissionScreen visible={noPermission} detail={noPermissionDetail} onRetry={handleRetry} />
 
       <div
+        key={`${currentUser?.id ?? 'u'}-${listSession}`}
         className={[
           'h-[100dvh] min-h-0 grid overflow-hidden',
           'grid-rows-[minmax(3.5rem,auto)_minmax(0,1fr)]',
@@ -546,15 +904,19 @@ export default function App() {
             listFullWidth={!!mobileIngresoListFull}
             documentsForTab={documentsForActiveDesktop}
             documentsIngresoMobile={mobileIngresoDocs}
-            signedDocs={signedDocs}
+            signedDocs={signedDocsForUser}
             signedQ={signedQInput}
             onSignedQChange={setSignedQInput}
+            pendingQ={pendingQInput}
+            onPendingQChange={setPendingQInput}
             signedOrigen={signedOrigen}
             onSignedOrigenChange={setSignedOrigen}
+            canRevealLocation={canRevealLocation}
             selectedDoc={selectedDoc}
             onTabChange={onTabChange}
             onSelectDoc={handleSelectDoc}
             onSelectSigned={handleSelectSigned}
+            listLoading={listBootLoading || (syncingTango && activeTab === 'pendientes')}
             adminMenu={{
               visible: activeTab === 'admin',
               active: adminSection,
@@ -606,6 +968,7 @@ export default function App() {
                     selectedPage={selectedPage}
                     onPlacementChange={setPlacement}
                     onPagesLoaded={handlePagesLoaded}
+                    canRevealLocation={canRevealLocation}
                   />
                 </div>
 

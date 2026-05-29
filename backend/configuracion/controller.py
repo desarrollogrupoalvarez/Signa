@@ -45,6 +45,17 @@ def put_rutas():
     pdi = data.get("path_destino_ingresos")
     if not all(isinstance(x, str) for x in (pb, pt, pbi, pdi)):
         abort(400, "Se requieren path_bandeja, path_transferencias, path_bandeja_ingresos, path_destino_ingresos (cadenas)")
+    from pathlib import Path
+
+    for label, val in (
+        ("path_bandeja", pb),
+        ("path_transferencias", pt),
+        ("path_bandeja_ingresos", pbi),
+        ("path_destino_ingresos", pdi),
+    ):
+        t = (val or "").strip()
+        if not t or not Path(t).is_absolute():
+            abort(400, f"{label} debe ser una ruta absoluta (o UNC)")
     try:
         t = apartados_svc.get_by_codigo(g.db, "transferencias", active_only=False)
         i = apartados_svc.get_by_codigo(g.db, "ingresos", active_only=False)

@@ -65,8 +65,15 @@ ROLES = [
     ),
     (
         "administrador",
-        "Administra apartados asignados (rutas y configuración, sin crear ni eliminar)",
-        ["apartados:editar"],
+        "Administra apartados asignados; ve y busca pendientes/firmados del apartado",
+        [
+            "apartados:editar",
+            "documentos:listar",
+            "documentos:ver",
+            "firmados:listar",
+            "firmados:ver",
+            "metricas:ver",
+        ],
     ),
 ]
 

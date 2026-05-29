@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { Copy, Download, FileText, FolderOpen } from 'lucide-react'
+import { Copy, Download, FileText } from 'lucide-react'
 import { toast } from 'sonner'
 import { API_BASE, apiFetch, getSignedFileUrl, getToken } from '../api/client'
+import { copySignedFilePath, toFileUrl } from '../utils/clientPath.js'
 import {
   parseFirmaZoneFromKeywords,
   transferenciaFirmaZone,
@@ -46,7 +47,14 @@ function mediaIsVideo(nombre) {
  * Renders PDF pages imperatively using pdfjs-dist.
  * Firmados: también imagen, texto, audio/vídeo u oficina/otros según categoría.
  */
-export default function PdfViewer({ selectedDoc, croppedFirma, selectedPage, onPlacementChange, onPagesLoaded }) {
+export default function PdfViewer({
+  selectedDoc,
+  croppedFirma,
+  selectedPage,
+  onPlacementChange,
+  onPagesLoaded,
+  canRevealLocation = false,
+}) {
   const visorRef = useRef(null)
   const contentRef = useRef(null)
   const pagesRef = useRef([]) // [{ pageNum, wrapEl }]
@@ -74,39 +82,9 @@ export default function PdfViewer({ selectedDoc, croppedFirma, selectedPage, onP
   const isTextoPlano = isSigned && firmadoCategoria === 'texto' && !['.html', '.htm'].includes(fileExtFromPath(signedName))
 
   const fileUrl = useMemo(() => {
-    if (!signedPath?.unc_folder) return null
-    const unc = signedPath.unc_folder.replace(/\\/g, '/')
-    const noLeading = unc.replace(/^\/+/, '')
-    return `file://${noLeading}`
-  }, [signedPath?.unc_folder])
-
-  async function copyText(text) {
-    if (!text) return false
-    try {
-      if (navigator.clipboard?.writeText) {
-        await navigator.clipboard.writeText(text)
-        return true
-      }
-    } catch {
-      // ignore
-    }
-    try {
-      const ta = document.createElement('textarea')
-      ta.value = text
-      ta.setAttribute('readonly', '')
-      ta.style.position = 'fixed'
-      ta.style.top = '-1000px'
-      ta.style.left = '-1000px'
-      document.body.appendChild(ta)
-      ta.select()
-      ta.setSelectionRange(0, ta.value.length)
-      const ok = document.execCommand && document.execCommand('copy')
-      document.body.removeChild(ta)
-      return !!ok
-    } catch {
-      return false
-    }
-  }
+    const p = signedPath?.unc_file || signedPath?.client_file
+    return toFileUrl(p)
+  }, [signedPath?.unc_file, signedPath?.client_file])
 
   async function loadSignedPath(nombre) {
     if (!nombre) return
@@ -418,40 +396,16 @@ export default function PdfViewer({ selectedDoc, croppedFirma, selectedPage, onP
       ref={visorRef}
       className="flex-1 min-w-0 overflow-y-auto p-5 flex flex-col items-center scrollbar-thin"
     >
-      {isSigned && signedName && (
+      {isSigned && signedName && canRevealLocation && (
         <div className="w-fit max-w-full mx-auto mb-2 flex items-center justify-end gap-2 flex-wrap">
           <button
             type="button"
-            onClick={async () => {
-              const text = signedPath?.unc_file || signedPath?.unc_folder || ''
-              const ok = await copyText(text)
-              if (ok) toast.success('Ruta copiada')
-              else window.prompt('Copiá la ruta:', text)
-            }}
-            className="px-3 py-2 rounded-card text-[12px] font-bold text-app-text bg-app-surface2 border border-app-border hover:border-app-muted disabled:opacity-50 transition-colors inline-flex items-center gap-2"
-            title="Copiar ruta del archivo (UNC)"
+            onClick={() => copySignedFilePath(signedName, { apiFetch, toast })}
+            className="px-3 py-2 rounded-card text-[12px] font-bold text-white bg-teal-600 hover:bg-teal-500 disabled:opacity-50 transition-colors inline-flex items-center gap-2"
+            title="Copiar ruta de archivo"
           >
             <Copy size={14} />
-            Copiar ruta
-          </button>
-
-          <button
-            type="button"
-            onClick={async () => {
-              try {
-                await apiFetch(`/api/firmados/reveal?n=${encodeURIComponent(signedName)}&mode=select`)
-              } catch (e) {
-                if (fileUrl) {
-                  try { window.open(fileUrl, '_blank', 'noreferrer') } catch { /* ignore */ }
-                }
-                toast.message('No se pudo abrir el Explorador automáticamente. Usá "Copiar ruta" y pegala en el Explorador.')
-              }
-            }}
-            className="px-3 py-2 rounded-card text-[12px] font-bold text-white bg-teal-600 hover:bg-teal-500 disabled:opacity-50 transition-colors inline-flex items-center gap-2"
-            title="Abrir ubicación del archivo en el Explorador"
-          >
-            <FolderOpen size={14} />
-            Abrir ubicación
+            Copiar ruta de archivo
           </button>
         </div>
       )}
@@ -502,7 +456,7 @@ export default function PdfViewer({ selectedDoc, croppedFirma, selectedPage, onP
           {firmadoCategoria === 'otro' &&
             firmadoOtroPanel(
               'Vista previa no disponible para este tipo',
-              'HEIC, comprimidos u otros: usá "Descargar" o "Abrir ubicación" en el Explorador.',
+              'HEIC, comprimidos u otros: usá "Descargar" o "Copiar ruta de archivo" y abrilo desde el Explorador.',
             )}
         </div>
       )}

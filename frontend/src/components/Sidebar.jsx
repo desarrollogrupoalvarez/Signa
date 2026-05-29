@@ -1,7 +1,8 @@
-import { FileText, FolderOpen } from 'lucide-react'
+import { Copy, FileText } from 'lucide-react'
 import { toast } from 'sonner'
 import { apiFetch } from '../api/client'
 import { displayNombreArchivo, displayPendingNombre, displaySignedNombre } from '../utils/displayDocName.js'
+import { copySignedFilePath } from '../utils/clientPath.js'
 
 export default function Sidebar({
   activeTab,
@@ -16,8 +17,11 @@ export default function Sidebar({
   signedDocs = [],
   signedQ = '',
   onSignedQChange = () => {},
+  pendingQ = '',
+  onPendingQChange = () => {},
   signedOrigen = 'todos',
   onSignedOrigenChange = () => {},
+  canRevealLocation = false,
   onlyIngresosLayout = false,
   listFullWidth = false,
   selectedDoc,
@@ -25,6 +29,7 @@ export default function Sidebar({
   onSelectDoc,
   onSelectSigned,
   adminMenu,
+  listLoading = false,
 }) {
   const list = onlyIngresosLayout
     ? documentsIngresoMobile
@@ -72,12 +77,24 @@ export default function Sidebar({
         </div>
       )}
 
+      {activeTab === 'pendientes' && !onlyIngresosLayout && (
+        <div className="px-3 py-2 border-b border-app-border flex-shrink-0">
+          <input
+            type="search"
+            placeholder="Buscar en pendientes"
+            value={pendingQ}
+            onChange={(e) => onPendingQChange(e.target.value)}
+            className="w-full text-[13px] px-3 py-2 rounded-lg border border-app-border bg-app-bg text-app-text placeholder:text-app-muted focus:outline-none focus:border-accent-dark transition-colors"
+          />
+        </div>
+      )}
+
       {/* Filtros firmados */}
       {activeTab === 'firmados' && showFirmados && (
         <div className="px-3 py-2 border-b border-app-border flex-shrink-0 space-y-2">
           <input
             type="search"
-            placeholder="Buscar"
+            placeholder="Buscar en digitalizados"
             value={signedQ}
             onChange={(e) => onSignedQChange(e.target.value)}
             className="w-full text-[13px] px-3 py-2 rounded-lg border border-app-border bg-app-bg text-app-text placeholder:text-app-muted focus:outline-none focus:border-accent-dark transition-colors"
@@ -104,7 +121,9 @@ export default function Sidebar({
 
       {/* List */}
       <div className="w-full min-h-0 flex-1 overflow-y-auto p-2 scrollbar-thin">
-        {activeTab === 'admin' ? (
+        {listLoading && activeTab !== 'admin' && activeTab !== 'metricas' ? (
+          <ListLoadingSkeleton tab={activeTab} />
+        ) : activeTab === 'admin' ? (
           <div className="py-3">
             <div className="px-2 pb-2">
               <div className="text-[10px] font-extrabold tracking-widest uppercase text-app-muted">Administración</div>
@@ -162,7 +181,11 @@ export default function Sidebar({
                 <div className="text-[12px] text-app-muted mt-1">{metricsDocs.length} archivo(s)</div>
               </div>
               {metricsDocs.map((d, idx) => (
-                <MetricDocItem key={`${d.apartado}::${d.archivo}::${idx}`} doc={d} />
+                <MetricDocItem
+                  key={`${d.apartado}::${d.archivo}::${idx}`}
+                  doc={d}
+                  canRevealLocation={canRevealLocation}
+                />
               ))}
             </div>
           )
@@ -183,39 +206,21 @@ export default function Sidebar({
   )
 }
 
-function toFileUrl(p) {
-  if (!p) return ''
-  const s = String(p)
-  if (s.startsWith('\\\\')) {
-    // UNC -> file://///server/share/...
-    return 'file://///' + s.slice(2).replace(/\\/g, '/')
-  }
-  // Local path (best effort)
-  return 'file:///' + s.replace(/\\/g, '/')
-}
-
-function MetricDocItem({ doc }) {
-  const carpeta = doc?.carpeta || ''
+function MetricDocItem({ doc, canRevealLocation = false }) {
   return (
     <div className="px-3 py-3 rounded-card border border-transparent hover:bg-app-surface2 hover:border-app-border transition-all">
       <div className="flex items-center gap-2">
         <div className="flex-1 min-w-0 text-[12px] font-semibold truncate text-app-text">
           {displayNombreArchivo(doc?.archivo) || '—'}
         </div>
-        {doc?.nombre_firmado && (
+        {canRevealLocation && doc?.nombre_firmado && (
           <button
             type="button"
-            title="Abrir ubicación del archivo en el Explorador"
+            title="Copiar ruta de archivo"
             className="shrink-0 p-1 rounded-md border border-app-border bg-app-bg text-app-muted hover:text-app-text hover:border-app-muted"
-            onClick={async () => {
-              try {
-                await apiFetch(`/api/firmados/reveal?n=${encodeURIComponent(doc.nombre_firmado)}&mode=select`)
-              } catch (e) {
-                toast.message('No se pudo abrir el Explorador automáticamente. Usá Digitalizados → Copiar ruta.')
-              }
-            }}
+            onClick={() => copySignedFilePath(doc.nombre_firmado, { apiFetch, toast })}
           >
-            <FolderOpen size={16} strokeWidth={1.75} />
+            <Copy size={16} strokeWidth={1.75} />
           </button>
         )}
       </div>
@@ -289,6 +294,23 @@ function SignedItem({ doc, active, onClick }) {
         {shortName}
       </div>
       <div className="text-[10px] text-app-muted font-mono">{date}</div>
+    </div>
+  )
+}
+
+function ListLoadingSkeleton({ tab }) {
+  const label = tab === 'firmados' ? 'Cargando digitalizados…' : 'Cargando pendientes…'
+  return (
+    <div className="py-2">
+      <p className="px-2 pb-3 text-[12px] text-app-muted">{label}</p>
+      <div className="space-y-2 animate-pulse">
+        {[1, 2, 3, 4, 5].map((i) => (
+          <div key={i} className="px-3 py-3 rounded-card border border-app-border/40 bg-app-surface2">
+            <div className="h-3 bg-app-border rounded w-[78%] mb-2" />
+            <div className="h-2 bg-app-border/60 rounded w-[38%]" />
+          </div>
+        ))}
+      </div>
     </div>
   )
 }
