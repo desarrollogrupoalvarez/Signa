@@ -9,6 +9,7 @@ from typing import Any, Sequence
 
 from config import Config
 from services import tango_queries
+from services.apartado_paths import parse_depositos
 from services.tango_comprobante_mapper import (
     group_ingresos,
     group_transferencias,
@@ -34,11 +35,6 @@ def fecha_rango(year: int, month: int | None) -> tuple[date, date]:
         last = calendar.monthrange(year, month)[1]
         return date(year, month, 1), date(year, month, last)
     return date(year, 1, 1), date(year, 12, 31)
-
-
-def _depositos(apartado: Any) -> list[str]:
-    cod_raw = (getattr(apartado, "cod_deposito", None) or "").strip()
-    return [x.strip() for x in cod_raw.replace(";", ",").split(",") if x.strip()]
 
 
 def _cantidad(val: Any) -> float | int | None:
@@ -194,9 +190,6 @@ def query_ingresos(
 ) -> dict[str, Any]:
     if not Config.tango_configured():
         raise RuntimeError("Tango no configurado en el servidor")
-    sources = Config.tango_transferencia_sources()
-    if not sources:
-        raise RuntimeError("Sin bases Tango configuradas (TANGO_DB_SAN_RAFAEL / TANGO_DB_CTC)")
 
     fecha_desde, fecha_hasta = fecha_rango(year, month)
     q_terms = [t for t in (q or "").strip().lower().split() if t]
@@ -207,20 +200,27 @@ def query_ingresos(
     fuentes: dict[str, int] = {}
 
     for ap in apartados:
-        deps = _depositos(ap)
-        if not deps:
-            continue
-        for src in sources:
+        for dep in parse_depositos(ap):
+            src = Config.tango_source_by_id(dep.tango_fuente)
+            if not src:
+                continue
+            deps_cods = list(dep.cod_depositos)
             try:
                 rows = tango_queries.fetch_ingresos_rango(
-                    deps,
+                    deps_cods,
                     fecha_desde,
                     fecha_hasta,
                     database=src.database,
                     tango_fuente=src.id,
                 )
             except Exception as ex:
-                logger.exception("metrics_ingresos [%s] apartado=%s: %s", src.id, ap.codigo, ex)
+                logger.exception(
+                    "metrics_ingresos [%s] apartado=%s dep=%s: %s",
+                    src.id,
+                    ap.codigo,
+                    dep.carpeta,
+                    ex,
+                )
                 continue
             filas_tango += len(rows)
             fuentes[src.id] = fuentes.get(src.id, 0) + len(rows)
@@ -251,9 +251,6 @@ def query_transferencias(
 ) -> dict[str, Any]:
     if not Config.tango_configured():
         raise RuntimeError("Tango no configurado en el servidor")
-    sources = Config.tango_transferencia_sources()
-    if not sources:
-        raise RuntimeError("Sin bases Tango configuradas (TANGO_DB_SAN_RAFAEL / TANGO_DB_CTC)")
 
     fecha_desde, fecha_hasta = fecha_rango(year, month)
     q_terms = [t for t in (q or "").strip().lower().split() if t]
@@ -264,20 +261,27 @@ def query_transferencias(
     fuentes: dict[str, int] = {}
 
     for ap in apartados:
-        deps = _depositos(ap)
-        if not deps:
-            continue
-        for src in sources:
+        for dep in parse_depositos(ap):
+            src = Config.tango_source_by_id(dep.tango_fuente)
+            if not src:
+                continue
+            deps_cods = list(dep.cod_depositos)
             try:
                 rows = tango_queries.fetch_transferencias_rango(
-                    deps,
+                    deps_cods,
                     fecha_desde,
                     fecha_hasta,
                     database=src.database,
                     tango_fuente=src.id,
                 )
             except Exception as ex:
-                logger.exception("metrics_transferencias [%s] apartado=%s: %s", src.id, ap.codigo, ex)
+                logger.exception(
+                    "metrics_transferencias [%s] apartado=%s dep=%s: %s",
+                    src.id,
+                    ap.codigo,
+                    dep.carpeta,
+                    ex,
+                )
                 continue
             filas_tango += len(rows)
             fuentes[src.id] = fuentes.get(src.id, 0) + len(rows)

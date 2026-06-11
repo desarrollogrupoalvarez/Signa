@@ -31,6 +31,40 @@ def get_estado_y_filename(db: "Session", apartado_id: int, clave: str) -> tuple[
     return row.estado, (row.pdf_filename or "").strip() or None
 
 
+def upsert_pendiente_bandeja(
+    db: "Session",
+    apartado_id: int,
+    pdf_filename: str,
+    *,
+    tango_clave: str | None = None,
+    tango_fecha: date | None = None,
+) -> ComprobanteTango:
+    """Garantiza fila pendiente para un PDF en bandeja (indexación / búsqueda)."""
+    name = (pdf_filename or "").strip()
+    clave = (tango_clave or "").strip()
+    if clave:
+        return upsert_pendiente(db, apartado_id, clave, name, tango_fecha)
+    row = (
+        db.query(ComprobanteTango)
+        .filter(
+            ComprobanteTango.apartado_id == apartado_id,
+            ComprobanteTango.pdf_filename == name,
+            ComprobanteTango.estado == "pendiente",
+        )
+        .first()
+    )
+    if row:
+        if tango_fecha is not None:
+            row.tango_fecha = (
+                tango_fecha.isoformat()[:10]
+                if hasattr(tango_fecha, "isoformat")
+                else (str(tango_fecha)[:10] if tango_fecha else None)
+            )
+        db.flush()
+        return row
+    return upsert_pendiente(db, apartado_id, f"bandeja:{name}", name, tango_fecha)
+
+
 def upsert_pendiente(
     db: "Session",
     apartado_id: int,
@@ -57,7 +91,21 @@ def upsert_pendiente(
     return row
 
 
-def mark_firmado(db: "Session", apartado_id: int, clave: str) -> None:
+def update_texto_contenido(
+    db: "Session", comprobante_id: int, texto: str, *, apartado_id: int | None = None
+) -> bool:
+    from services.comprobante_text_index import update_texto_contenido as _update
+
+    return _update(db, comprobante_id, texto, apartado_id=apartado_id)
+
+
+def mark_firmado(
+    db: "Session",
+    apartado_id: int,
+    clave: str,
+    *,
+    ruta_firmado: str | None = None,
+) -> None:
     row = (
         db.query(ComprobanteTango)
         .filter(ComprobanteTango.apartado_id == apartado_id, ComprobanteTango.clave == clave)
@@ -65,7 +113,19 @@ def mark_firmado(db: "Session", apartado_id: int, clave: str) -> None:
     )
     if row:
         row.estado = "firmado"
+        if ruta_firmado:
+            from services.comprobante_text_index import normalizar_ruta
+
+            row.ruta = normalizar_ruta(ruta_firmado)
         db.flush()
+        from services.comprobante_text_index import reindexar_comprobante_firmado
+
+        try:
+            reindexar_comprobante_firmado(
+                db, apartado_id, clave, ruta_firmado=ruta_firmado
+            )
+        except Exception:
+            pass
 
 
 def clave_by_pdf_filename(db: "Session", apartado_id: int, pdf_filename: str) -> str | None:

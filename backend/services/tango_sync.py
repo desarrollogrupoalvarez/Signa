@@ -82,10 +82,14 @@ def _registrar_y_contar(
     tango_fecha: date | None,
     tango_usr: str | None,
     fuente: str,
+    indexar: bool = False,
 ) -> bool:
     ok = documents.register(
         path_pdf,
         silent=True,
+        skip_guard=True,
+        skip_exists_check=True,
+        indexar=indexar,
         apartado_codigo=apartado.codigo,
         modo_flujo=apartado.modo_flujo,
         prefijo=apartado.prefijo,
@@ -164,10 +168,13 @@ def _procesar_grupo(
     documents.remove_pending_by_tango_clave(clave, bandeja_root, delete_file=False)
 
     try:
-        out = generar_fn(datos, bandeja_dir, h)
-        comprobante_tango_store.upsert_pendiente(
-            db, apartado.id, clave, out.name, tango_fecha
+        row = comprobante_tango_store.upsert_pendiente(
+            db, apartado.id, clave, fname, tango_fecha
         )
+        out = generar_fn(datos, bandeja_dir, h, comprobante_id=row.id)
+        if out.name != fname:
+            row.pdf_filename = out.name
+            db.flush()
         result["generados"].append(out.name)
         result["generados_por_fuente"].setdefault(fuente, []).append(out.name)
         _registrar_y_contar(
@@ -403,11 +410,25 @@ def sync_apartado(
         result["errores"].append(f"modo_flujo no soportado: {modo}")
         return result
 
+    committed = False
     try:
         db.commit()
+        committed = True
     except Exception as ex:
         db.rollback()
         result["errores"].append(f"commit: {ex}")
+
+    if committed:
+        try:
+            from services.comprobante_index_queue import encolar_pendientes_apartado
+
+            encolar_pendientes_apartado(
+                int(apartado.id),
+                filter_fecha=fecha.isoformat(),
+                limit=50,
+            )
+        except Exception as ex:
+            logger.warning("INDEX_SYNC_ENCOLAR | apartado=%s | %s", apartado.codigo, ex)
 
     _log_sync_resumen(apartado, fecha, result)
     return result

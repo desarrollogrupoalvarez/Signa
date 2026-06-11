@@ -71,7 +71,10 @@ function documentosConPdfGenerado(documentos) {
   return out
 }
 
-const MetricsPage = forwardRef(function MetricsPage({ apartados = [], onDocsChange = () => {}, onLoadingChange }, ref) {
+const MetricsPage = forwardRef(function MetricsPage(
+  { apartados = [], onDocsChange = () => {}, onLoadingChange, onSearchQueryChange = () => {} },
+  ref,
+) {
   const [loading, setLoading] = useState(false)
   const [mode, setMode] = useState('ingresos') // 'ingresos' | 'transferencias'
   const now = new Date()
@@ -150,6 +153,10 @@ const MetricsPage = forwardRef(function MetricsPage({ apartados = [], onDocsChan
   useEffect(() => {
     onLoadingChange?.(loading)
   }, [loading, onLoadingChange])
+
+  useEffect(() => {
+    onSearchQueryChange(q)
+  }, [q, onSearchQueryChange])
 
   useEffect(() => {
     load()
@@ -256,7 +263,7 @@ const MetricsPage = forwardRef(function MetricsPage({ apartados = [], onDocsChan
   }
 
   return (
-    <div className="flex-1 overflow-y-auto p-5 scrollbar-thin">
+    <div className="h-full w-full min-h-0 min-w-0 overflow-y-auto p-5 scrollbar-thin">
       <div className="w-full space-y-4">
         <div>
           <h2 className="text-[15px] font-extrabold tracking-widest uppercase text-app-text">Registros</h2>

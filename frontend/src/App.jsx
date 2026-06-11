@@ -10,6 +10,7 @@ import Sidebar from './components/Sidebar'
 import SignaturePanel from './components/SignaturePanel'
 import IngresoAttachments from './components/IngresoAttachments'
 import MetricsPage from './components/MetricsPage'
+import MetricsPdfOverlay from './components/MetricsPdfOverlay'
 import { useCroppedSignature } from './hooks/useCroppedSignature'
 import { useIsMobile } from './hooks/useIsMobile'
 import { useDebounce } from './hooks/useDebounce'
@@ -50,10 +51,10 @@ function pickDefaultTab(perms = [], { mobileIngresosOnly = false, apartados = []
   const aps = apartados || []
   const ing = aps.filter((x) => x.modo_flujo === 'ingreso')
   const tra = aps.filter((x) => x.modo_flujo === 'transferencia')
-  if (mobileIngresosOnly && perms.includes('documentos:listar') && ing.length) return 'pendientes'
-  if (perms.includes('documentos:listar')) return 'pendientes'
-  if (perms.includes('firmados:listar')) return 'firmados'
-  if (perms.includes('metricas:ver')) return 'metricas'
+  if (mobileIngresosOnly && perms.includes('pendientes:ver') && ing.length) return 'pendientes'
+  if (perms.includes('pendientes:ver')) return 'pendientes'
+  if (perms.includes('digitalizados:ver')) return 'firmados'
+  if (perms.includes('registros:ver')) return 'metricas'
   if (
     perms.includes('apartados:gestionar') ||
     perms.includes('apartados:editar') ||
@@ -63,7 +64,7 @@ function pickDefaultTab(perms = [], { mobileIngresosOnly = false, apartados = []
   ) {
     return 'admin'
   }
-  return 'firmados'
+  return 'admin'
 }
 
 function todayBuenosAires() {
@@ -84,13 +85,21 @@ export default function App() {
   const [signedQInput, setSignedQInput] = useState('')
   const [pendingQInput, setPendingQInput] = useState('')
   const [signedOrigen, setSignedOrigen] = useState('todos')
-  const signedQDeb = useDebounce(signedQInput, 400, listSession)
+  const [signedViewMode, setSignedViewMode] = useState(() => {
+    try {
+      return localStorage.getItem('signa_signed_view_mode') === 'flat' ? 'flat' : 'tree'
+    } catch {
+      return 'tree'
+    }
+  })
+  const signedQDeb = useDebounce(signedQInput, 600, listSession)
   const pendingQDeb = useDebounce(pendingQInput, 400, listSession)
   const [selectedDoc, setSelectedDoc] = useState(null)
   const [connected, setConnected] = useState(false)
   const [currentUser, setCurrentUser] = useState(null)
   const [adminSection, setAdminSection] = useState('rutas')
   const [metricsDocs, setMetricsDocs] = useState([])
+  const [metricsSearchQ, setMetricsSearchQ] = useState('')
   const [activeApartadoCodigo, setActiveApartadoCodigo] = useState('')
   const [syncFecha, setSyncFecha] = useState(() => todayBuenosAires())
   const [syncingTango, setSyncingTango] = useState(false)
@@ -125,7 +134,17 @@ export default function App() {
   const activeTabRef = useRef(activeTab)
   const skipNextPollFetchRef = useRef(false)
   const signedPrefetchDoneRef = useRef(false)
+  const signedQDebRef = useRef('')
+  const signedOrigenRef = useRef('todos')
   const isMobile = useIsMobile()
+
+  useEffect(() => {
+    signedQDebRef.current = signedQDeb
+  }, [signedQDeb])
+
+  useEffect(() => {
+    signedOrigenRef.current = signedOrigen
+  }, [signedOrigen])
 
   useEffect(() => {
     currentUserRef.current = currentUser
@@ -190,9 +209,10 @@ export default function App() {
 
   const permissions = currentUser?.permissions || []
   const apartados = currentUser?.apartados || []
-  const canPendientes = permissions.includes('documentos:listar')
-  const canFirmados = permissions.includes('firmados:listar')
-  const canMetricas = permissions.includes('metricas:ver')
+  const canPendientes = permissions.includes('pendientes:ver')
+  const canFirmar = permissions.includes('pendientes:firmar')
+  const canFirmados = permissions.includes('digitalizados:ver')
+  const canMetricas = permissions.includes('registros:ver')
   const canApartadosGestion = permissions.includes('apartados:gestionar')
   const canApartadosCrear =
     canApartadosGestion || permissions.includes('apartados:crear')
@@ -295,6 +315,7 @@ export default function App() {
     const user = currentUserRef.current
     const sessionUser = normListUsername(user?.username)
     if (!sessionUser) return
+    if (!(user?.permissions || []).includes('pendientes:ver')) return
     const listGen = listSessionRef.current
     const fetchId = documentsFetchIdRef.current
     documentsAbortRef.current?.abort()
@@ -381,7 +402,7 @@ export default function App() {
   }, [])
 
   const syncTangoAndRefresh = useCallback(
-    async ({ showToasts = true, force = false } = {}) => {
+    async ({ showToasts = true, force = false, listFirst = true } = {}) => {
       const codigo = resolveApartadoCodigoForSync()
       if (!codigo) {
         if (showToasts) toast.error('Seleccioná un apartado')
@@ -397,6 +418,9 @@ export default function App() {
         }
         return { skipped: true, cached: true }
       }
+      if (listFirst) {
+        await fetchDocuments({ silent: true })
+      }
       try {
         const res = await apiFetch(`/api/apartados/${encodeURIComponent(codigo)}/sincronizar-tango`, {
           method: 'POST',
@@ -405,27 +429,30 @@ export default function App() {
         const data = await res.json()
         markTangoSynced(cacheKey)
         if (showToasts) showTangoSyncToasts(data)
+        await fetchDocuments({ silent: true })
+        return { skipped: false, data }
       } catch (e) {
         if (e.status === 401 || e.status === 403) {
           handlePermissionError(e.detail)
           throw e
         }
         if (showToasts) toast.error(e.message || 'Error al sincronizar con Tango')
+        await fetchDocuments({ silent: true })
+        return { skipped: false, error: e }
       }
-      await fetchDocuments({ silent: true })
-      return { skipped: false }
     },
     [resolveApartadoCodigoForSync, syncFecha, fetchDocuments, showTangoSyncToasts, handlePermissionError],
   )
 
   const syncTango = useCallback(async () => {
+    await fetchDocuments({ silent: true })
     setSyncingTango(true)
     try {
-      await syncTangoAndRefresh({ showToasts: true, force: true })
+      await syncTangoAndRefresh({ showToasts: true, force: true, listFirst: false })
     } finally {
       setSyncingTango(false)
     }
-  }, [syncTangoAndRefresh])
+  }, [syncTangoAndRefresh, fetchDocuments])
 
   const fetchSigned = useCallback(async (opts = {}) => {
     const { silent = false, fresh = false, mergeOptimistic = false } = opts
@@ -436,12 +463,14 @@ export default function App() {
     signedAbortRef.current?.abort()
     const ac = new AbortController()
     signedAbortRef.current = ac
-    if (!silent) setRefreshingSigned(true)
+    const q = (signedQDebRef.current || '').trim()
+    const searching = !!q
+    if (!silent || searching) setRefreshingSigned(true)
     try {
       const sp = new URLSearchParams()
-      const q = (signedQDeb || '').trim()
       if (q) sp.set('q', q)
-      if (signedOrigen && signedOrigen !== 'todos') sp.set('origen', signedOrigen)
+      const origen = signedOrigenRef.current
+      if (origen && origen !== 'todos') sp.set('origen', origen)
       if (fresh) sp.set('fresh', '1')
       sp.set('_', String(Date.now()))
       const qs = sp.toString()
@@ -464,13 +493,13 @@ export default function App() {
       if (e.status === 401 || e.status === 403) handlePermissionError(e.detail)
       else {
         setConnected(false)
-        if (!silent) toast.error('No se pudo cargar firmados: ' + e.message)
+        if (!silent || searching) toast.error('No se pudo cargar digitalizados: ' + e.message)
       }
     } finally {
       if (signedAbortRef.current === ac) signedAbortRef.current = null
-      if (!silent && fetchId === signedFetchIdRef.current) setRefreshingSigned(false)
+      if ((!silent || searching) && fetchId === signedFetchIdRef.current) setRefreshingSigned(false)
     }
-  }, [handlePermissionError, signedQDeb, signedOrigen])
+  }, [handlePermissionError])
 
   const bootstrapSessionAfterAuth = useCallback(async () => {
     const user = currentUserRef.current
@@ -480,22 +509,22 @@ export default function App() {
     setListBootLoading(true)
     try {
       const perms = user.permissions || []
-      const canListPending = perms.includes('documentos:listar')
-      const canListSigned = perms.includes('firmados:listar')
-      const bootTab = activeTabRef.current
+      const canListPending = perms.includes('pendientes:ver')
+      const canListSigned = perms.includes('digitalizados:ver')
 
       if (!canListPending && !canListSigned) return
 
       if (canListPending) {
         await fetchDocuments({ silent: true })
-      } else if (canListSigned && bootTab === 'firmados') {
+      }
+      if (canListSigned) {
         await fetchSigned({ silent: true, mergeOptimistic: false })
       }
     } catch (e) {
       if (e?.status === 401 || e?.status === 403) return
       if (bootGen === listSessionRef.current) {
         const perms = user.permissions || []
-        if (perms.includes('documentos:listar')) {
+        if (perms.includes('pendientes:ver')) {
           try {
             await fetchDocuments({ silent: true })
           } catch {
@@ -529,11 +558,14 @@ export default function App() {
   /** Refresca pendientes y digitalizados sin bloquear la UI (p. ej. tras firmar). */
   const refreshListsAfterPendingChange = useCallback(() => {
     const perms = currentUserRef.current?.permissions || []
-    const tasks = [fetchDocuments({ silent: true })]
-    if (perms.includes('firmados:listar')) {
-      tasks.push(fetchSigned({ silent: true, fresh: true, mergeOptimistic: true }))
+    const tasks = []
+    if (perms.includes('pendientes:ver')) {
+      tasks.push(fetchDocuments({ silent: true }))
     }
-    void Promise.all(tasks).catch(() => {})
+    if (perms.includes('digitalizados:ver')) {
+      tasks.push(fetchSigned({ silent: true, mergeOptimistic: true }))
+    }
+    if (tasks.length) void Promise.all(tasks).catch(() => {})
   }, [fetchDocuments, fetchSigned])
 
   const listRefreshLoading =
@@ -542,9 +574,6 @@ export default function App() {
       : activeTab === 'metricas'
         ? refreshingMetrics
         : false
-
-  const canRevealLocation =
-    currentUser?.role === 'superadmin' || currentUser?.role === 'administrador'
 
   function handleListRefresh() {
     if (activeTab === 'firmados') {
@@ -568,7 +597,7 @@ export default function App() {
         const perms = me?.permissions || []
         const aps = me?.apartados || []
         const ingresoCount = aps.filter((a) => a?.modo_flujo === 'ingreso').length
-        const mobileIngresosOnly = mobile && perms.includes('documentos:listar') && ingresoCount > 0
+        const mobileIngresosOnly = mobile && perms.includes('pendientes:ver') && ingresoCount > 0
         setActiveTab(pickDefaultTab(perms, { mobileIngresosOnly, apartados: aps }))
         if (wasBootstrap) {
           shouldBootstrapRef.current = true
@@ -598,6 +627,14 @@ export default function App() {
       }
       return
     }
+    const qActive = !!(signedQDeb || '').trim()
+    if (qActive) {
+      if (signedPollRef.current) {
+        clearInterval(signedPollRef.current)
+        signedPollRef.current = null
+      }
+      return
+    }
     fetchSigned({ silent: true })
     if (signedPollRef.current) clearInterval(signedPollRef.current)
     signedPollRef.current = setInterval(
@@ -610,7 +647,21 @@ export default function App() {
         signedPollRef.current = null
       }
     }
-  }, [activeTab, fetchSigned, token, currentUser, listBootLoading, canFirmados])
+  }, [activeTab, fetchSigned, token, currentUser, listBootLoading, canFirmados, signedQDeb])
+
+  useEffect(() => {
+    if (!token || !currentUser || listBootLoading || !canFirmados) return
+    if (activeTab !== 'firmados') return
+    const q = (signedQDeb || '').trim()
+    if (!q) return
+    fetchSigned({ silent: false, mergeOptimistic: false })
+  }, [signedQDeb, activeTab, fetchSigned, token, currentUser, listBootLoading, canFirmados])
+
+  useEffect(() => {
+    if (!token || !currentUser || listBootLoading || !canFirmados) return
+    if (activeTabRef.current !== 'firmados') return
+    fetchSigned({ silent: true, mergeOptimistic: false })
+  }, [signedOrigen, fetchSigned, token, currentUser, listBootLoading, canFirmados])
 
   useEffect(() => {
     if (!token || !currentUser || listBootLoading || !canFirmados) return
@@ -622,8 +673,11 @@ export default function App() {
 
   useEffect(() => {
     if (!token || !currentUser || listBootLoading) return
-    if (activeTab === 'admin') {
-      if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null }
+    if (activeTab === 'admin' || !canPendientes || activeTab !== 'pendientes') {
+      if (pollRef.current) {
+        clearInterval(pollRef.current)
+        pollRef.current = null
+      }
       return
     }
     if (skipNextPollFetchRef.current) {
@@ -639,7 +693,7 @@ export default function App() {
         pollRef.current = null
       }
     }
-  }, [fetchDocuments, activeTab, token, currentUser, listBootLoading])
+  }, [fetchDocuments, activeTab, token, currentUser, listBootLoading, canPendientes])
 
   useEffect(() => {
     if (selectedDoc?.tipo === 'pendiente') {
@@ -737,7 +791,7 @@ export default function App() {
         }),
       })
       const data = await res.json()
-      if (currentUserRef.current?.permissions?.includes('firmados:listar')) {
+      if (currentUserRef.current?.permissions?.includes('digitalizados:ver')) {
         applyOptimisticSigned(data.archivo_firmado, signedApartado)
       }
       const listGen = listSessionRef.current
@@ -773,7 +827,7 @@ export default function App() {
         body: JSON.stringify({ dispositivo }),
       })
       const data = await res.json()
-      if (currentUserRef.current?.permissions?.includes('firmados:listar')) {
+      if (currentUserRef.current?.permissions?.includes('digitalizados:ver')) {
         applyOptimisticSigned(data.archivo_firmado, signedApartado)
       }
       const listGen = listSessionRef.current
@@ -794,9 +848,9 @@ export default function App() {
     try {
       await apiFetch('/api/health')
       setConnected(true)
-      if (activeTab === 'firmados') await fetchSigned()
-      else await fetchDocuments()
-      if (!pollRef.current) {
+      if (activeTab === 'firmados' && canFirmados) await fetchSigned()
+      else if (activeTab === 'pendientes' && canPendientes) await fetchDocuments()
+      if (canPendientes && activeTab === 'pendientes' && !pollRef.current) {
         pollRef.current = setInterval(() => fetchDocuments({ silent: true }), POLL_INTERVAL)
       }
     } catch (e) {
@@ -818,7 +872,7 @@ export default function App() {
     selectedDoc?.tipo === 'pendiente' && selectedDoc?.modo_flujo === 'transferencia'
   )
   const canRenderIngresoPanel = isMobile && selectedDoc?.modo_flujo === 'ingreso'
-  const canRenderSignPanel = !isMobile && canPendientes && activeTab === 'pendientes' && selectedDoc?.modo_flujo === 'transferencia'
+  const canRenderSignPanel = !isMobile && canFirmar && activeTab === 'pendientes' && selectedDoc?.modo_flujo === 'transferencia'
   const hideMobileIngresoSidebar = onlyMobileIngresos && !!selectedDoc
   const mobileIngresoListFull = onlyMobileIngresos && !selectedDoc
 
@@ -828,13 +882,19 @@ export default function App() {
   }
 
   const headerSuffix =
-    activeTab === 'firmados'
+    activeTab === 'firmados' && canFirmados
       ? 'DIGITALIZADOS'
-      : activeTab === 'metricas'
+      : activeTab === 'metricas' && canMetricas
         ? 'REGISTROS'
         : activeTab === 'admin'
           ? 'ADMIN'
-          : 'PENDIENTES'
+          : canPendientes
+            ? 'PENDIENTES'
+            : canFirmados
+              ? 'DIGITALIZADOS'
+              : canMetricas
+                ? 'REGISTROS'
+                : 'SIGNA'
 
   function handlePagesLoaded(n) {
     setNumPages(n)
@@ -849,8 +909,16 @@ export default function App() {
     }
     if (activeTab === 'firmados' && !canFirmados) {
       setActiveTab(defaultTab)
+      return
     }
-  }, [activeTab, canFirmados, showAdmin, currentUser, defaultTab])
+    if (activeTab === 'metricas' && !canMetricas) {
+      setActiveTab(defaultTab)
+      return
+    }
+    if (activeTab === 'pendientes' && !canPendientes) {
+      setActiveTab(defaultTab)
+    }
+  }, [activeTab, canFirmados, canMetricas, canPendientes, showAdmin, currentUser, defaultTab])
   if (!token) {
     return <LoginPage onLogin={handleLogin} />
   }
@@ -897,9 +965,11 @@ export default function App() {
           <Sidebar
             activeTab={activeTab}
             apartadoTabsOrigins={apartados}
+            showPendientes={canPendientes}
             showFirmados={!isMobile && canFirmados}
             showMetricas={!isMobile && canMetricas}
             metricsDocs={metricsDocs}
+            metricsSearchQ={metricsSearchQ}
             onlyIngresosLayout={!!onlyMobileIngresos}
             listFullWidth={!!mobileIngresoListFull}
             documentsForTab={documentsForActiveDesktop}
@@ -911,12 +981,20 @@ export default function App() {
             onPendingQChange={setPendingQInput}
             signedOrigen={signedOrigen}
             onSignedOrigenChange={setSignedOrigen}
-            canRevealLocation={canRevealLocation}
+            signedViewMode={signedViewMode}
+            onSignedViewModeChange={(mode) => {
+              setSignedViewMode(mode)
+              try {
+                localStorage.setItem('signa_signed_view_mode', mode)
+              } catch {
+                /* ignore */
+              }
+            }}
             selectedDoc={selectedDoc}
             onTabChange={onTabChange}
             onSelectDoc={handleSelectDoc}
             onSelectSigned={handleSelectSigned}
-            listLoading={listBootLoading || (syncingTango && activeTab === 'pendientes')}
+            listLoading={listBootLoading || (syncingTango && activeTab === 'pendientes') || (refreshingSigned && activeTab === 'firmados')}
             adminMenu={{
               visible: activeTab === 'admin',
               active: adminSection,
@@ -924,7 +1002,7 @@ export default function App() {
                 ...((showAdmin && (canApartadosEditar || permissions.includes('configuracion:rutas')))
                   ? [{ id: 'rutas', label: 'Rutas' }]
                   : []),
-                ...(canApartadosCrear ? [{ id: 'apartados', label: 'Apartados' }] : []),
+                ...(canApartadosCrear ? [{ id: 'areas', label: 'Areas' }, { id: 'apartados', label: 'Apartados' }] : []),
                 ...(permissions.some((p) => p.startsWith('usuarios:')) ? [{ id: 'usuarios', label: 'Usuarios' }] : []),
                 ...(permissions.some((p) => p.startsWith('roles:')) ? [{ id: 'roles', label: 'Roles' }] : []),
               ],
@@ -943,13 +1021,24 @@ export default function App() {
           >
             {activeTab === 'admin' ? (
               <AdminPage currentUser={currentUser} section={adminSection} />
-            ) : activeTab === 'metricas' ? (
-              <MetricsPage
-                ref={metricsPageRef}
-                apartados={apartados}
-                onDocsChange={setMetricsDocs}
-                onLoadingChange={setRefreshingMetrics}
-              />
+            ) : activeTab === 'metricas' && canMetricas ? (
+              <div className="relative flex-1 w-full min-h-0 min-w-0 overflow-hidden">
+                <MetricsPage
+                  ref={metricsPageRef}
+                  apartados={apartados}
+                  onDocsChange={setMetricsDocs}
+                  onLoadingChange={setRefreshingMetrics}
+                  onSearchQueryChange={setMetricsSearchQ}
+                />
+                {selectedDoc?.tipo === 'firmado' && (
+                  <MetricsPdfOverlay
+                    selectedDoc={selectedDoc}
+                    selectedPage={selectedPage}
+                    onPagesLoaded={handlePagesLoaded}
+                    onClose={() => setSelectedDoc(null)}
+                  />
+                )}
+              </div>
             ) : canRenderIngresoPanel ? (
               <IngresoAttachments
                 docId={selectedDoc.id}
@@ -968,7 +1057,6 @@ export default function App() {
                     selectedPage={selectedPage}
                     onPlacementChange={setPlacement}
                     onPagesLoaded={handlePagesLoaded}
-                    canRevealLocation={canRevealLocation}
                   />
                 </div>
 

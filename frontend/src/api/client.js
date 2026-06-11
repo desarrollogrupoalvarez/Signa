@@ -58,3 +58,18 @@ export function getSignedFileUrl(nombre) {
   const base = `${API_BASE}/api/firmados/archivo?n=${encodeURIComponent(nombre || '')}`
   return token ? `${base}&token=${encodeURIComponent(token)}` : base
 }
+
+/** Descarga un archivo firmado por su nombre de listado (p. ej. TRA/.../archivo.pdf). */
+export function downloadSignedFile(nombre) {
+  const n = (nombre || '').trim()
+  if (!n) return
+  const url = getSignedFileUrl(n)
+  const base = n.replace(/\\/g, '/').split('/').filter(Boolean).pop() || 'documento.pdf'
+  const a = document.createElement('a')
+  a.href = url
+  a.download = base
+  a.rel = 'noreferrer'
+  document.body.appendChild(a)
+  a.click()
+  a.remove()
+}

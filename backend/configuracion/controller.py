@@ -1,3 +1,4 @@
+from config import Config
 from flask import Blueprint, abort, g, jsonify, request
 
 from core.middleware import require_auth
@@ -7,20 +8,22 @@ from services import apartados as apartados_svc
 bp = Blueprint("configuracion", __name__, url_prefix="/api/configuracion")
 
 
-@bp.route("/rutas", methods=["GET"])
-@require_auth("configuracion:rutas")
-def get_rutas():
-    """Compat: retorna rutas de los apartados transferencias/ingresos."""
-    from config import Config
-
-    t = apartados_svc.get_by_codigo(g.db, "transferencias", active_only=False)
-    i = apartados_svc.get_by_codigo(g.db, "ingresos", active_only=False)
-    eff = {
+def _eff_from_defaults(db):
+    t = apartados_svc.get_default_by_modo_flujo(db, "transferencia")
+    i = apartados_svc.get_default_by_modo_flujo(db, "ingreso")
+    return {
         "bandeja_entrada": (t.bandeja_path if t else ""),
         "transferencias_root": (t.destino_path if t else ""),
         "bandeja_ingresos": (i.bandeja_path if i else ""),
         "destino_ingresos": (i.destino_path if i else ""),
     }
+
+
+@bp.route("/rutas", methods=["GET"])
+@require_auth("configuracion:rutas")
+def get_rutas():
+    """Compat: retorna rutas de los apartados default por modo_flujo."""
+    eff = _eff_from_defaults(g.db)
     return jsonify(
         {
             "efectivo": eff,
@@ -57,10 +60,10 @@ def put_rutas():
         if not t or not Path(t).is_absolute():
             abort(400, f"{label} debe ser una ruta absoluta (o UNC)")
     try:
-        t = apartados_svc.get_by_codigo(g.db, "transferencias", active_only=False)
-        i = apartados_svc.get_by_codigo(g.db, "ingresos", active_only=False)
+        t = apartados_svc.get_default_by_modo_flujo(g.db, "transferencia")
+        i = apartados_svc.get_default_by_modo_flujo(g.db, "ingreso")
         if not t or not i:
-            abort(500, "Apartados base no encontrados (transferencias/ingresos)")
+            abort(500, "Apartados base no encontrados (transferencia/ingreso por modo_flujo)")
         t.bandeja_path = pb.strip()
         t.destino_path = pt.strip()
         i.bandeja_path = pbi.strip()
@@ -77,12 +80,4 @@ def put_rutas():
         from logging import getLogger
 
         getLogger("remitos").warning("restart_inbox_watcher: %s", ex)
-    t = apartados_svc.get_by_codigo(g.db, "transferencias", active_only=False)
-    i = apartados_svc.get_by_codigo(g.db, "ingresos", active_only=False)
-    eff = {
-        "bandeja_entrada": (t.bandeja_path if t else ""),
-        "transferencias_root": (t.destino_path if t else ""),
-        "bandeja_ingresos": (i.bandeja_path if i else ""),
-        "destino_ingresos": (i.destino_path if i else ""),
-    }
-    return jsonify({"ok": True, "efectivo": eff})
+    return jsonify({"ok": True, "efectivo": _eff_from_defaults(g.db)})

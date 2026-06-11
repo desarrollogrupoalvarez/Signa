@@ -1,10 +1,9 @@
 """
-Apartados: lectura, seed inicial, sincronización con rutas legacy, helpers para API.
+Apartados: lectura, seed inicial, sincronizacion con rutas legacy, helpers para API.
 """
 
 from __future__ import annotations
 
-import os
 import logging
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -18,8 +17,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("remitos")
 
-CODIGO_TRA = "transferencias"
-CODIGO_ING = "ingresos"
+AREA_CODIGO_DEFAULT = "daudet"
+CODIGO_TRA_DAUDET = "transferencias_daudet"
+CODIGO_ING_DAUDET = "ingresos_daudet"
 
 
 def get_by_codigo(
@@ -67,28 +67,26 @@ def list_active_apartados(db: "Session") -> list:
     )
 
 
-def get_tra_ing_from_db(db: "Session") -> tuple["Apartado | None", "Apartado | None"]:
-    t = get_by_codigo(db, CODIGO_TRA)
-    i = get_by_codigo(db, CODIGO_ING)
-    return t, i
+def get_default_by_modo_flujo(db: "Session", modo_flujo: str) -> "Apartado | None":
+    from models.apartado import Apartado
+    from models.area import Area
+
+    return (
+        db.query(Apartado)
+        .outerjoin(Area, Apartado.area_id == Area.id)
+        .filter(Apartado.modo_flujo == modo_flujo, Apartado.activo.is_(True))
+        .order_by(Area.orden, Apartado.orden, Apartado.codigo)
+        .first()
+    )
 
 
 def briefs_for_effective_user(db: "Session", user: "User | None") -> list[dict]:
-    """Lista ordenada {codigo, nombre, modo_flujo, prefijo, id, orden} visibles según rol y asignación."""
-    from models.apartado import Apartado
-    from core.apartado_access import apartado_codes_for_user
+    """Lista ordenada por area y apartado visible segun rol y asignacion."""
+    from core.apartado_access import effective_apartados_for_user
 
     if not user or not user.role:
         return []
-    codes = apartado_codes_for_user(db, user, user.role.name)
-    if not codes:
-        return []
-    rows = (
-        db.query(Apartado)
-        .filter(Apartado.activo.is_(True), Apartado.codigo.in_(codes))
-        .order_by(Apartado.orden, Apartado.codigo)
-        .all()
-    )
+    rows = effective_apartados_for_user(db, user, user.role.name)
     return [a.to_brief() for a in rows]
 
 
@@ -97,9 +95,25 @@ def codigos_for_jwt_user(db: "Session", user: "User | None") -> list[str]:
     return [x["codigo"] for x in d]
 
 
+def _ensure_default_area(db: "Session"):
+    from models.area import Area
+
+    area = db.query(Area).filter(Area.codigo == AREA_CODIGO_DEFAULT).first()
+    if not area:
+        area = Area(
+            codigo=AREA_CODIGO_DEFAULT,
+            nombre="Depósito Daudet",
+            activo=True,
+            orden=0,
+        )
+        db.add(area)
+        db.flush()
+    return area
+
+
 def seed_default_apartados_from_legacy_if_empty(db: "Session") -> int:
     """
-    Si no hay filas, crea transferencias e ingresos a partir de env (fallback legacy).
+    Si no hay filas, crea area Daudet + transferencias_daudet e ingresos_daudet desde env.
     """
     from models.apartado import Apartado
 
@@ -121,23 +135,26 @@ def seed_default_apartados_from_legacy_if_empty(db: "Session") -> int:
         depositos_to_json,
     )
 
+    area = _ensure_default_area(db)
     tra = Apartado(
-        codigo=CODIGO_TRA,
-        nombre="Transferencias",
+        area_id=area.id,
+        codigo=CODIGO_TRA_DAUDET,
+        nombre="Transferencias Daudet",
         bandeja_path=tra_b,
         destino_path=tra_d,
         modo_flujo="transferencia",
-        prefijo="t",
+        prefijo="td",
         activo=True,
         orden=0,
     )
     ing = Apartado(
-        codigo=CODIGO_ING,
-        nombre="Ingresos",
+        area_id=area.id,
+        codigo=CODIGO_ING_DAUDET,
+        nombre="Ingresos Daudet",
         bandeja_path=ing_b,
         destino_path=ing_d,
         modo_flujo="ingreso",
-        prefijo="i",
+        prefijo="id",
         activo=True,
         orden=1,
     )
@@ -149,15 +166,14 @@ def seed_default_apartados_from_legacy_if_empty(db: "Session") -> int:
     db.add(ing)
     db.commit()
     path_settings.invalidate_cache()
-    logger.info("Seed apartados: transferencias + ingresos creados")
+    logger.info("Seed apartados: area daudet + transferencias_daudet + ingresos_daudet")
     return 2
 
 
 def sync_tra_ing_from_resolved_dict(db: "Session", eff: dict[str, str]) -> None:
-    """Mantiene filas `transferencias` e `ingresos` alineadas con get_resolved (tras guardar rutas)."""
-    from models.apartado import Apartado
-
-    t, i = get_tra_ing_from_db(db)
+    """Mantiene apartados default por modo_flujo alineados con get_resolved."""
+    t = get_default_by_modo_flujo(db, "transferencia")
+    i = get_default_by_modo_flujo(db, "ingreso")
     if t:
         t.bandeja_path = eff.get("bandeja_entrada") or t.bandeja_path
         t.destino_path = eff.get("transferencias_root") or t.destino_path
@@ -167,7 +183,6 @@ def sync_tra_ing_from_resolved_dict(db: "Session", eff: dict[str, str]) -> None:
     if t or i:
         db.commit()
         path_settings.invalidate_cache()
-
 
 
 def tango_usernames_for_apartado(db: "Session", apartado: "Apartado") -> list[str]:
@@ -197,6 +212,20 @@ def tango_usernames_for_apartado(db: "Session", apartado: "Apartado") -> list[st
     return sorted({(u.username or "").strip().upper() for u in rows if (u.username or "").strip()})
 
 
+def count_apartados_modo_en_area(db: "Session", area_id: int, modo_flujo: str) -> int:
+    from models.apartado import Apartado
+
+    return (
+        db.query(Apartado)
+        .filter(
+            Apartado.area_id == int(area_id),
+            Apartado.modo_flujo == modo_flujo,
+            Apartado.activo.is_(True),
+        )
+        .count()
+    )
+
+
 def create_apartado(
     db: "Session",
     *,
@@ -206,13 +235,15 @@ def create_apartado(
     destino_path: str,
     modo_flujo: str,
     prefijo: str,
+    area_id: int,
     activo: bool = True,
     orden: int | None = None,
-    cod_deposito: str | None = "2",
+    cod_deposito: str | None = "",
     depositos_config: list | str | None = None,
     categorias_destino: list | str | None = None,
 ) -> "Apartado":
     from models.apartado import Apartado
+    from services import areas as areas_svc
 
     if modo_flujo not in ("transferencia", "ingreso"):
         raise ValueError("modo_flujo debe ser transferencia o ingreso")
@@ -220,16 +251,17 @@ def create_apartado(
     p = (prefijo or "").strip()
     if not c or not p or len(p) > 8:
         raise ValueError("codigo y prefijo requeridos (prefijo max 8 caracteres)")
-    if c in (CODIGO_TRA, CODIGO_ING):
-        raise ValueError("codigos reservados: transferencias, ingresos (usá edición o rutas)")
+    area = areas_svc.get_by_id(db, int(area_id))
+    if not area:
+        raise ValueError("area_id invalido")
     for label, s in (("bandeja_path", bandeja_path), ("destino_path", destino_path)):
         t = (s or "").strip()
         if not t or not Path(t).is_absolute():
             raise ValueError(f"{label} requerido y debe ser ruta absoluta (o UNC)")
     if db.query(Apartado).filter(Apartado.codigo == c).first():
-        raise ValueError("El código ya existe")
+        raise ValueError("El codigo ya existe")
     if db.query(Apartado).filter(Apartado.prefijo == p).first():
-        raise ValueError("El prefijo ya está en uso")
+        raise ValueError("El prefijo ya esta en uso")
     from services.apartado_paths import (
         DepositoConfig,
         default_depositos_for_apartado,
@@ -240,8 +272,9 @@ def create_apartado(
     )
 
     o = orden if orden is not None else (db.query(Apartado).count() + 1)
-    cod_dep = (cod_deposito or "2").strip() or "2"
+    cod_dep = (cod_deposito or "").strip()
     tmp = Apartado(
+        area_id=area.id,
         codigo=c,
         nombre=(nombre or c).strip() or c,
         bandeja_path=(bandeja_path or "").strip(),
@@ -259,7 +292,6 @@ def create_apartado(
         dep_json = depositos_to_json(default_depositos_for_apartado(tmp))
     cat_json = "[]"
     if modo_flujo in ("transferencia", "ingreso") and categorias_destino is not None:
-        # Legacy: categorías globales → se copian a depósitos sin categorías en el payload
         global_cats = validate_categorias_payload(categorias_destino, modo_flujo=modo_flujo)
         deps_parsed = depositos_from_json(dep_json)
         if global_cats and deps_parsed and not any(d.categorias for d in deps_parsed):
@@ -276,6 +308,7 @@ def create_apartado(
             dep_json = depositos_to_json(deps_parsed)
 
     a = Apartado(
+        area_id=area.id,
         codigo=c,
         nombre=tmp.nombre,
         bandeja_path=tmp.bandeja_path,
@@ -319,6 +352,18 @@ def apply_apartado_config_fields(ap: "Apartado", data: dict) -> None:
                 setattr(ap, key, n)
             else:
                 setattr(ap, key, data[key])
+    if "area_id" in data and data["area_id"] is not None:
+        from sqlalchemy.orm import object_session
+
+        sess = object_session(ap)
+        if not sess:
+            raise ValueError("area_id invalido")
+        from services import areas as areas_svc
+
+        area = areas_svc.get_by_id(sess, int(data["area_id"]))
+        if not area:
+            raise ValueError("area_id invalido")
+        ap.area_id = area.id
     if "modo_flujo" in data and ap.modo_flujo not in ("transferencia", "ingreso"):
         raise ValueError("modo_flujo debe ser transferencia o ingreso")
     for label in ("bandeja_path", "destino_path"):
@@ -378,3 +423,20 @@ def assign_user_apartados_by_ids(db: "Session", user: "User", apartado_ids: list
         db.query(Apartado).filter(Apartado.id.in_(apartado_ids), Apartado.activo.is_(True)).all()
     )
     u.apartados = ap_rows
+
+
+def assign_user_areas_by_ids(db: "Session", user: "User", area_ids: list[int] | None) -> None:
+    from models.area import Area
+    from models.user import User as UserModel
+
+    u = db.query(UserModel).filter(UserModel.id == user.id).first()
+    if not u:
+        raise LookupError("Usuario no encontrado")
+    if (u.role and u.role.name) == "superadmin":
+        u.areas = []
+        return
+    if not area_ids:
+        u.areas = []
+        return
+    rows = db.query(Area).filter(Area.id.in_(area_ids), Area.activo.is_(True)).all()
+    u.areas = rows

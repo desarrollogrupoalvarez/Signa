@@ -19,11 +19,20 @@ class Role(Base, TimestampMixin):
     description = Column(String(255), nullable=False, default="")
 
     permissions = relationship("Permission", secondary=role_permissions, lazy="joined")
+    digitalizado_carpetas = relationship(
+        "RoleDigitalizadoCarpeta",
+        back_populates="role",
+        lazy="joined",
+        cascade="all, delete-orphan",
+    )
 
     def to_dict(self) -> dict:
+        from core.permissions import effective_permissions
+
         return {
             "id": self.id,
             "name": self.name,
             "description": self.description,
-            "permissions": [p.name for p in self.permissions],
+            "permissions": effective_permissions([p.name for p in self.permissions]),
+            "digitalizado_carpetas": [c.to_dict() for c in (self.digitalizado_carpetas or [])],
         }

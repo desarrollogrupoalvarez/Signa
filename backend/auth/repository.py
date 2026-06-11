@@ -11,6 +11,7 @@ class AuthRepository:
         return self._db.query(User).options(
             joinedload(User.role).joinedload(Role.permissions),
             joinedload(User.apartados),
+            joinedload(User.areas),
         )
 
     def get_by_username(self, username: str) -> User | None:

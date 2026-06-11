@@ -21,6 +21,7 @@ class Apartado(Base, TimestampMixin):
     __tablename__ = "apartados"
 
     id = Column(Integer, primary_key=True)
+    area_id = Column(Integer, ForeignKey("areas.id", ondelete="RESTRICT"), nullable=True, index=True)
     codigo = Column(String(64), unique=True, nullable=False, index=True)
     nombre = Column(String(200), nullable=False)
     bandeja_path = Column(String(2000), nullable=False)
@@ -38,6 +39,15 @@ class Apartado(Base, TimestampMixin):
     orden = Column(Integer, default=0, nullable=False)
 
     users = relationship("User", secondary=user_apartado, back_populates="apartados", lazy="dynamic")
+    area = relationship("Area", back_populates="apartados", lazy="joined")
+
+    def _area_fields(self) -> dict:
+        a = self.area
+        return {
+            "area_id": self.area_id,
+            "area_codigo": a.codigo if a else None,
+            "area_nombre": a.nombre if a else None,
+        }
 
     def to_brief(self) -> dict:
         return {
@@ -47,6 +57,7 @@ class Apartado(Base, TimestampMixin):
             "modo_flujo": self.modo_flujo,
             "prefijo": self.prefijo,
             "orden": self.orden,
+            **self._area_fields(),
         }
 
     def to_dict(self) -> dict:

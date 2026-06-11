@@ -1,8 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { Copy, Download, FileText } from 'lucide-react'
-import { toast } from 'sonner'
-import { API_BASE, apiFetch, getSignedFileUrl, getToken } from '../api/client'
-import { copySignedFilePath, toFileUrl } from '../utils/clientPath.js'
+import { Download, FileText } from 'lucide-react'
+import { API_BASE, apiFetch, downloadSignedFile, getSignedFileUrl, getToken } from '../api/client'
+import { toFileUrl } from '../utils/clientPath.js'
 import {
   parseFirmaZoneFromKeywords,
   transferenciaFirmaZone,
@@ -53,7 +52,7 @@ export default function PdfViewer({
   selectedPage,
   onPlacementChange,
   onPagesLoaded,
-  canRevealLocation = false,
+  hideSignedToolbar = false,
 }) {
   const visorRef = useRef(null)
   const contentRef = useRef(null)
@@ -396,16 +395,16 @@ export default function PdfViewer({
       ref={visorRef}
       className="flex-1 min-w-0 overflow-y-auto p-5 flex flex-col items-center scrollbar-thin"
     >
-      {isSigned && signedName && canRevealLocation && (
+      {isSigned && signedName && firmadoCategoria === 'pdf' && !hideSignedToolbar && (
         <div className="w-fit max-w-full mx-auto mb-2 flex items-center justify-end gap-2 flex-wrap">
           <button
             type="button"
-            onClick={() => copySignedFilePath(signedName, { apiFetch, toast })}
+            onClick={() => downloadSignedFile(signedName)}
             className="px-3 py-2 rounded-card text-[12px] font-bold text-white bg-teal-600 hover:bg-teal-500 disabled:opacity-50 transition-colors inline-flex items-center gap-2"
-            title="Copiar ruta de archivo"
+            title="Descargar PDF"
           >
-            <Copy size={14} />
-            Copiar ruta de archivo
+            <Download size={14} />
+            Descargar PDF
           </button>
         </div>
       )}
@@ -456,7 +455,7 @@ export default function PdfViewer({
           {firmadoCategoria === 'otro' &&
             firmadoOtroPanel(
               'Vista previa no disponible para este tipo',
-              'HEIC, comprimidos u otros: usá "Descargar" o "Copiar ruta de archivo" y abrilo desde el Explorador.',
+              'HEIC, comprimidos u otros: descargalo con el botón de abajo y abrilo desde el Explorador.',
             )}
         </div>
       )}

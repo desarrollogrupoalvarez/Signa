@@ -1,5 +1,6 @@
 ﻿import { ChevronLeft, LogOut, RefreshCw, Settings } from 'lucide-react'
 import LogoMark from './LogoMark.jsx'
+import { groupApartadosByArea } from '../utils/apartadoAreas.js'
 
 function ListRefreshButton({ onClick, loading = false, compact = false, className = '' }) {
   return (
@@ -32,19 +33,32 @@ function TangoSyncControls({
   compact = false,
   showApartadoSelect = true,
 }) {
+  const grouped = groupApartadosByArea(apartados)
+  const multiArea = grouped.length > 1
+
   return (
     <div className={['items-center gap-2', className].join(' ')}>
       {showApartadoSelect && (
         <select
-          className="min-w-0 flex-1 rounded-lg border border-app-border bg-app-surface2 px-2 py-1.5 text-[11px] text-app-text sm:flex-none sm:max-w-[10rem]"
+          className="min-w-0 flex-1 rounded-lg border border-app-border bg-app-surface2 px-2 py-1.5 text-[11px] text-app-text sm:flex-none sm:max-w-[14rem]"
           value={activeApartadoCodigo || ''}
           onChange={(e) => onApartadoChange?.(e.target.value)}
         >
-          {(apartados || []).map((a) => (
-            <option key={a.codigo} value={a.codigo}>
-              {a.nombre}
-            </option>
-          ))}
+          {multiArea
+            ? grouped.map((g) => (
+                <optgroup key={g.area_id ?? g.area_codigo} label={g.area_nombre}>
+                  {(g.apartados || []).map((a) => (
+                    <option key={a.codigo} value={a.codigo}>
+                      {a.nombre}
+                    </option>
+                  ))}
+                </optgroup>
+              ))
+            : (apartados || []).map((a) => (
+                <option key={a.codigo} value={a.codigo}>
+                  {a.nombre}
+                </option>
+              ))}
         </select>
       )}
       <input

@@ -139,8 +139,6 @@ def depositos_from_json(raw: str | list | None) -> list[DepositoConfig]:
         if not fuente:
             continue
         cods = _parse_cod_depositos(it.get("cod_depositos"))
-        if not cods:
-            cods = ("2",)
         cats = tuple(categorias_from_json(it.get("categorias")))
         out.append(
             DepositoConfig(
@@ -226,8 +224,8 @@ def _enrich_depositos_categorias(
 
 def default_depositos_for_apartado(apartado: "Apartado") -> list[DepositoConfig]:
     """Fallback: fuentes Tango globales + cod_deposito del apartado."""
-    cod_raw = (getattr(apartado, "cod_deposito", None) or "2").strip()
-    cods = _parse_cod_depositos(cod_raw) or ("2",)
+    cod_raw = (getattr(apartado, "cod_deposito", None) or "").strip()
+    cods = _parse_cod_depositos(cod_raw)
     default_cats = ()
     if getattr(apartado, "modo_flujo", None) in ("transferencia", "ingreso"):
         default_cats = tuple(default_categorias_transferencia(apartado))

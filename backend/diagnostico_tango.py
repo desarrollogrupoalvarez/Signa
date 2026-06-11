@@ -343,7 +343,7 @@ def run_diagnostico(fecha_str: str, modo: str = "transferencias") -> None:
                 print("  usuarios Tango    : {}".format(usrs_app))
 
                 if not deps_app:
-                    print("\n  [PROBLEMA] El apartado no tiene cod_deposito configurado.")
+                    print("\n  [INFO] cod_deposito vacío: consultas sin filtro (todos los depósitos).")
                 if not usrs_app:
                     print("\n  [PROBLEMA] No hay usuarios activos asignados al apartado.")
     except Exception as ex:

@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from services.apartado_paths import SIN_FIRMAR
+from services.file_search import file_search_matches
 from services.metrics_ingresos import parse_ingreso_pdf
 from services.metrics_transferencias import parse_transfer_pdf
 
@@ -48,6 +49,26 @@ def _path_matches_period(p: Path, root: Path, year_i: int | None, month_s: str |
     if month_s and month_s not in rel_parts:
         return False
     return True
+
+
+def _iter_pdfs_for_period(root: Path, year_i: int | None, month_s: str | None):
+    """Recorre PDFs del período evitando un rglob completo del árbol cuando hay año/mes."""
+    if year_i and month_s:
+        yield from root.glob(f"**/Año {year_i}/{month_s}/*.pdf")
+        return
+    if year_i:
+        yield from root.glob(f"**/Año {year_i}/**/*.pdf")
+        return
+    yield from root.rglob("*.pdf")
+
+
+def _resolve_dest_root(apartado) -> Path | None:
+    from services.path_settings import resolve_storage_path
+
+    raw = getattr(apartado, "destino_path", None)
+    if not raw:
+        return None
+    return resolve_storage_path(raw)
 
 
 def _filter_ingreso_items(m, q_terms: list[str], p: Path) -> list | None:
@@ -119,6 +140,50 @@ def _filter_transfer_items(m, q_terms: list[str]) -> list | None:
     return matched_items
 
 
+def _lightweight_ingreso_entry(a, p: Path, root: Path) -> dict[str, Any]:
+    rel = str(p.relative_to(root)).replace("\\", "/")
+    return {
+        "apartado": a.codigo,
+        "origen_datos": "pdf",
+        "archivo": p.name,
+        "carpeta": str(p.parent),
+        "ruta": str(p),
+        "nombre_firmado": f"{(a.prefijo or 'x').strip()[:8]}/{rel}",
+        "proveedor": "",
+        "fecha": "",
+        "remito_interno": "",
+        "remito_proveedor": "",
+        "deposito": "",
+        "orden": "",
+        "items_total": 0,
+        "items_match": 0,
+        "items": [],
+    }
+
+
+def _lightweight_transfer_entry(a, p: Path, root: Path) -> dict[str, Any]:
+    pfx = (a.prefijo or "x").strip()[:8]
+    try:
+        rel = f"{pfx}/" + str(p.relative_to(root)).replace("\\", "/")
+    except Exception:
+        rel = f"{pfx}/" + p.name
+    return {
+        "apartado": a.codigo,
+        "origen_datos": "pdf",
+        "archivo": p.name,
+        "carpeta": str(p.parent),
+        "ruta": str(p),
+        "nombre_firmado": rel,
+        "comprobante": "",
+        "fecha": "",
+        "origen": "",
+        "destino": "",
+        "items_total": 0,
+        "items_match": 0,
+        "items": [],
+    }
+
+
 def list_ingresos_pdfs(
     apartados: Sequence[Any],
     *,
@@ -126,20 +191,22 @@ def list_ingresos_pdfs(
     month: str,
     q: str = "",
     limit: int = 2500,
+    parse_content: bool = True,
 ) -> tuple[list[dict[str, Any]], int]:
-    """Todos los PDFs del período; si hay q, filtra por proveedor/ítems."""
+    """PDFs del período; con q filtra por proveedor/ítems. Sin q evita leer el contenido del PDF."""
     q_terms = [t for t in (q or "").strip().lower().split() if t]
+    q_raw = (q or "").strip()
     year_i, month_s = _year_month_filters(year, month)
     limit = max(1, min(2500, limit))
     out: list[dict[str, Any]] = []
     scanned = 0
 
     for a in apartados:
-        root = Path(a.destino_path)
-        if not root.is_dir():
+        root = _resolve_dest_root(a)
+        if not root or not root.is_dir():
             continue
         try:
-            for p in root.rglob("*.pdf"):
+            for p in _iter_pdfs_for_period(root, year_i, month_s):
                 if scanned >= limit:
                     break
                 if not p.is_file():
@@ -147,6 +214,12 @@ def list_ingresos_pdfs(
                 if _skip_sin_firmar_path(p, root):
                     continue
                 if not _path_matches_period(p, root, year_i, month_s):
+                    continue
+                if parse_content and q_terms and not file_search_matches(p, q_raw):
+                    continue
+                if not parse_content:
+                    out.append(_lightweight_ingreso_entry(a, p, root))
+                    scanned += 1
                     continue
                 m = parse_ingreso_pdf(p)
                 matched_items = _filter_ingreso_items(m, q_terms, p)
@@ -194,21 +267,22 @@ def list_transferencias_pdfs(
     month: str,
     q: str = "",
     limit: int = 2000,
+    parse_content: bool = True,
 ) -> tuple[list[dict[str, Any]], int]:
-    """Todos los PDFs del período; si hay q, filtra por encabezado/ítems."""
+    """PDFs del período; con q filtra por encabezado/ítems. Sin q evita leer el contenido del PDF."""
     q_terms = [t for t in (q or "").strip().lower().split() if t]
+    q_raw = (q or "").strip()
     year_i, month_s = _year_month_filters(year, month)
     limit = max(1, min(2000, limit))
     out: list[dict[str, Any]] = []
     scanned = 0
 
     for a in apartados:
-        root = Path(a.destino_path)
-        if not root.is_dir():
+        root = _resolve_dest_root(a)
+        if not root or not root.is_dir():
             continue
-        pfx = (a.prefijo or "x").strip()[:8]
         try:
-            for p in root.rglob("*.pdf"):
+            for p in _iter_pdfs_for_period(root, year_i, month_s):
                 if scanned >= limit:
                     break
                 if not p.is_file():
@@ -217,15 +291,21 @@ def list_transferencias_pdfs(
                     continue
                 if not _path_matches_period(p, root, year_i, month_s):
                     continue
+                if parse_content and q_terms and not file_search_matches(p, q_raw):
+                    continue
+                if not parse_content:
+                    out.append(_lightweight_transfer_entry(a, p, root))
+                    scanned += 1
+                    continue
                 m = parse_transfer_pdf(p)
                 matched_items = _filter_transfer_items(m, q_terms)
                 if matched_items is None:
                     continue
                 rel = None
                 try:
-                    rel = f"{pfx}/" + str(p.relative_to(root)).replace("\\", "/")
+                    rel = f"{(a.prefijo or 'x').strip()[:8]}/" + str(p.relative_to(root)).replace("\\", "/")
                 except Exception:
-                    rel = f"{pfx}/" + p.name
+                    rel = f"{(a.prefijo or 'x').strip()[:8]}/" + p.name
                 out.append(
                     {
                         "apartado": a.codigo,

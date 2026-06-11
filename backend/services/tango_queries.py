@@ -20,6 +20,19 @@ def _in_placeholders(n: int) -> str:
     return ", ".join("?" for _ in range(n))
 
 
+def _deposito_where_clause(cod_depositos: Sequence[str]) -> tuple[str, list[str]]:
+    """
+    Filtro SQL por depósito. Lista vacía (campo en blanco) = todos los depósitos, sin IN.
+    """
+    deps = [str(x).strip() for x in cod_depositos if str(x).strip()]
+    if not deps:
+        return "", []
+    return (
+        f"  AND CAST(S20.COD_DEPOSI AS VARCHAR(20)) IN ({_in_placeholders(len(deps))})\n",
+        deps,
+    )
+
+
 def _fetch_all(
     sql: str, params: Sequence[Any], *, database: str
 ) -> list[dict[str, Any]]:
@@ -42,9 +55,9 @@ def fetch_transferencias(
     database: str,
     tango_fuente: str,
 ) -> list[dict[str, Any]]:
-    deps = [str(x).strip() for x in cod_depositos if str(x).strip()]
+    dep_clause, dep_params = _deposito_where_clause(cod_depositos)
     usrs = [str(x).strip().upper() for x in usuarios if str(x).strip()]
-    if not deps or not usrs:
+    if not usrs:
         return []
     sch = _schema(database)
     sql = f"""
@@ -74,12 +87,11 @@ LEFT JOIN {sch}.STA22 Origen ON S20.COD_DEPOSI = Origen.COD_SUCURS
 LEFT JOIN {sch}.STA22 Destino ON S20.DEPOSI_DDE = Destino.COD_SUCURS
 WHERE S14.T_COMP LIKE 'TRA'
   AND S20.TIPO_MOV LIKE 'S'
-  AND CAST(S20.COD_DEPOSI AS VARCHAR(20)) IN ({_in_placeholders(len(deps))})
-  AND S14.USUARIO IN ({_in_placeholders(len(usrs))})
+{dep_clause}  AND S14.USUARIO IN ({_in_placeholders(len(usrs))})
   AND CAST(S14.FECHA_MOV AS DATE) = ?
 ORDER BY S14.ID_STA14, S14.HORA_COMP
 """
-    params: list[Any] = list(deps) + list(usrs) + [fecha.isoformat()]
+    params: list[Any] = list(dep_params) + list(usrs) + [fecha.isoformat()]
     rows = _fetch_all(sql, params, database=database)
     fuente = (tango_fuente or "").strip().upper()
     for r in rows:
@@ -96,9 +108,7 @@ def fetch_transferencias_rango(
     tango_fuente: str,
 ) -> list[dict[str, Any]]:
     """Transferencias en rango de fechas, sin filtro por USUARIO (Registros)."""
-    deps = [str(x).strip() for x in cod_depositos if str(x).strip()]
-    if not deps:
-        return []
+    dep_clause, dep_params = _deposito_where_clause(cod_depositos)
     sch = _schema(database)
     sql = f"""
 SELECT
@@ -127,12 +137,11 @@ LEFT JOIN {sch}.STA22 Origen ON S20.COD_DEPOSI = Origen.COD_SUCURS
 LEFT JOIN {sch}.STA22 Destino ON S20.DEPOSI_DDE = Destino.COD_SUCURS
 WHERE S14.T_COMP LIKE 'TRA'
   AND S20.TIPO_MOV LIKE 'S'
-  AND CAST(S20.COD_DEPOSI AS VARCHAR(20)) IN ({_in_placeholders(len(deps))})
-  AND CAST(S14.FECHA_MOV AS DATE) >= ?
+{dep_clause}  AND CAST(S14.FECHA_MOV AS DATE) >= ?
   AND CAST(S14.FECHA_MOV AS DATE) <= ?
 ORDER BY S14.ID_STA14, S14.HORA_COMP
 """
-    params: list[Any] = list(deps) + [fecha_desde.isoformat(), fecha_hasta.isoformat()]
+    params: list[Any] = list(dep_params) + [fecha_desde.isoformat(), fecha_hasta.isoformat()]
     rows = _fetch_all(sql, params, database=database)
     fuente = (tango_fuente or "").strip().upper()
     for r in rows:
@@ -148,9 +157,9 @@ def fetch_ingresos(
     database: str,
     tango_fuente: str | None = None,
 ) -> list[dict[str, Any]]:
-    deps = [str(x).strip() for x in cod_depositos if str(x).strip()]
+    dep_clause, dep_params = _deposito_where_clause(cod_depositos)
     usrs = [str(x).strip().upper() for x in usuarios if str(x).strip()]
-    if not deps or not usrs:
+    if not usrs:
         return []
     db = (database or "").strip()
     if not db:
@@ -187,12 +196,11 @@ LEFT JOIN {sch}.CPA01 C1 ON S14.COD_PRO_CL = C1.COD_PROVEE
 LEFT JOIN {sch}.medida m ON S11.ID_MEDIDA_STOCK = m.ID_MEDIDA
 WHERE S14.T_COMP LIKE 'REM'
   AND S20.TIPO_MOV LIKE 'E'
-  AND CAST(S20.COD_DEPOSI AS VARCHAR(20)) IN ({_in_placeholders(len(deps))})
-  AND S14.USUARIO IN ({_in_placeholders(len(usrs))})
+{dep_clause}  AND S14.USUARIO IN ({_in_placeholders(len(usrs))})
   AND CAST(S14.FECHA_MOV AS DATE) = ?
 ORDER BY S14.ID_STA14, S14.HORA_COMP
 """
-    params = list(deps) + list(usrs) + [fecha.isoformat()]
+    params = list(dep_params) + list(usrs) + [fecha.isoformat()]
     rows = _fetch_all(sql, params, database=db)
     fuente = (tango_fuente or "").strip().upper()
     if fuente:
@@ -210,9 +218,7 @@ def fetch_ingresos_rango(
     tango_fuente: str | None = None,
 ) -> list[dict[str, Any]]:
     """Ingresos (REM/E) en rango de fechas, sin filtro por USUARIO (Registros)."""
-    deps = [str(x).strip() for x in cod_depositos if str(x).strip()]
-    if not deps:
-        return []
+    dep_clause, dep_params = _deposito_where_clause(cod_depositos)
     db = (database or "").strip()
     if not db:
         return []
@@ -248,12 +254,11 @@ LEFT JOIN {sch}.CPA01 C1 ON S14.COD_PRO_CL = C1.COD_PROVEE
 LEFT JOIN {sch}.medida m ON S11.ID_MEDIDA_STOCK = m.ID_MEDIDA
 WHERE S14.T_COMP LIKE 'REM'
   AND S20.TIPO_MOV LIKE 'E'
-  AND CAST(S20.COD_DEPOSI AS VARCHAR(20)) IN ({_in_placeholders(len(deps))})
-  AND CAST(S14.FECHA_MOV AS DATE) >= ?
+{dep_clause}  AND CAST(S14.FECHA_MOV AS DATE) >= ?
   AND CAST(S14.FECHA_MOV AS DATE) <= ?
 ORDER BY S14.ID_STA14, S14.HORA_COMP
 """
-    params = list(deps) + [fecha_desde.isoformat(), fecha_hasta.isoformat()]
+    params = list(dep_params) + [fecha_desde.isoformat(), fecha_hasta.isoformat()]
     rows = _fetch_all(sql, params, database=db)
     fuente = (tango_fuente or "").strip().upper()
     if fuente:

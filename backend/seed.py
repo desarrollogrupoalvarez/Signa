@@ -16,63 +16,52 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
 from core.database import db_session
+from core.permissions import PERMISSIONS
 from core.security import hash_password
 from models.apartado import Apartado
 from models.permission import Permission
 from models.role import Role, role_permissions
 from models.user import User
 
-# ── Permission catalogue ──────────────────────────────────────────────────────
-#  (name, description, resource, action)
-PERMISSIONS = [
-    ("documentos:listar",  "Listar remitos pendientes",          "documentos", "listar"),
-    ("documentos:ver",     "Ver / descargar remito PDF",         "documentos", "ver"),
-    ("documentos:firmar",  "Firmar un remito",                   "documentos", "firmar"),
-    ("firmados:listar",    "Listar remitos firmados",            "firmados",   "listar"),
-    ("firmados:ver",       "Ver / descargar remito firmado",     "firmados",   "ver"),
-    ("usuarios:listar",    "Listar usuarios del sistema",        "usuarios",   "listar"),
-    ("usuarios:crear",     "Crear un nuevo usuario",             "usuarios",   "crear"),
-    ("usuarios:editar",    "Editar datos de un usuario",         "usuarios",   "editar"),
-    ("usuarios:eliminar",  "Desactivar un usuario",              "usuarios",   "eliminar"),
-    ("roles:listar",       "Listar roles disponibles",           "roles",      "listar"),
-    ("roles:gestionar",    "Crear / editar / asignar roles",     "roles",      "gestionar"),
-    ("configuracion:rutas", "Gestionar rutas de archivos (bandeja, transferencias)", "configuracion", "rutas"),
-    ("apartados:gestionar", "Acceso total a apartados (crear, editar todos, eliminar)", "apartados", "gestionar"),
-    ("apartados:crear", "Dar de alta apartados nuevos", "apartados", "crear"),
-    ("apartados:editar", "Editar configuración de apartados asignados al usuario", "apartados", "editar"),
-    ("metricas:ver",       "Ver métricas de ingresos/OC",          "metricas",   "ver"),
-]
-
 # ── Role catalogue ────────────────────────────────────────────────────────────
-#  (name, description, list_of_permission_names)
 ROLES = [
     (
         "superadmin",
         "Super administrador — acceso total al sistema",
-        [p[0] for p in PERMISSIONS],          # all permissions
+        [p[0] for p in PERMISSIONS],
     ),
     (
         "firmante",
         "Operador de firma — gestiona y firma remitos",
-        ["documentos:listar", "documentos:ver", "documentos:firmar",
-         "firmados:listar", "firmados:ver"],
+        [
+            "pendientes:ver",
+            "pendientes:firmar",
+            "digitalizados:ver",
+            "digitalizados:ver_todo",
+            "digitalizados:ver_archivo",
+        ],
     ),
     (
         "consulta",
         "Solo lectura — visualiza remitos sin poder firmar",
-        ["documentos:listar", "documentos:ver",
-         "firmados:listar", "firmados:ver"],
+        [
+            "pendientes:ver",
+            "digitalizados:ver",
+            "digitalizados:ver_todo",
+            "digitalizados:ver_archivo",
+        ],
     ),
     (
         "administrador",
         "Administra apartados asignados; ve y busca pendientes/firmados del apartado",
         [
             "apartados:editar",
-            "documentos:listar",
-            "documentos:ver",
-            "firmados:listar",
-            "firmados:ver",
-            "metricas:ver",
+            "pendientes:ver",
+            "pendientes:ver_todos",
+            "digitalizados:ver",
+            "digitalizados:ver_todo",
+            "digitalizados:ver_archivo",
+            "registros:ver",
         ],
     ),
 ]
@@ -83,7 +72,6 @@ def seed():
         from services.apartados import seed_default_apartados_from_legacy_if_empty
 
         seed_default_apartados_from_legacy_if_empty(db)
-        # ── Permissions ───────────────────────────────────────────────────────
         perm_map: dict[str, Permission] = {}
         for name, desc, resource, action in PERMISSIONS:
             perm = db.query(Permission).filter(Permission.name == name).first()
@@ -91,10 +79,13 @@ def seed():
                 perm = Permission(name=name, description=desc, resource=resource, action=action)
                 db.add(perm)
                 print(f"  + permission: {name}")
+            else:
+                perm.description = desc
+                perm.resource = resource
+                perm.action = action
             perm_map[name] = perm
         db.flush()
 
-        # ── Roles ─────────────────────────────────────────────────────────────
         role_map: dict[str, Role] = {}
         for role_name, role_desc, perm_names in ROLES:
             role = db.query(Role).filter(Role.name == role_name).first()
@@ -106,7 +97,6 @@ def seed():
             role_map[role_name] = role
         db.flush()
 
-        # ── Superadmin user ───────────────────────────────────────────────────
         superadmin_password = os.environ.get("SUPERADMIN_PASSWORD", "Admin1234!")
 
         existing = db.query(User).filter(User.username == "superadmin").first()
@@ -122,14 +112,17 @@ def seed():
         else:
             print("  · user superadmin already exists — skipped")
 
-        # Asignar todos los apartados a usuarios no superadmin (comportamiento previo: acceso a ambas bandejas)
         aps = db.query(Apartado).order_by(Apartado.orden, Apartado.codigo).all()
-        if aps:
+        from models.area import Area
+
+        default_area = db.query(Area).filter(Area.codigo == "daudet").first()
+        if aps and default_area:
             for u in db.query(User).all():
                 if u.role and u.role.name == "superadmin":
                     continue
-                u.apartados = list(aps)
-            print(f"  · user_apartado: asignados {len(aps)} apartado(s) a usuarios (excepto superadmin)")
+                u.areas = [default_area]
+                u.apartados = []
+            print(f"  · user_area: asignada area daudet a usuarios (excepto superadmin)")
 
     print("\nSeed completed OK")
 

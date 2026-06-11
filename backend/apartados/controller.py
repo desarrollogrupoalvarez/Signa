@@ -16,9 +16,9 @@ from core.apartado_admin import (
 )
 from core.middleware import require_auth
 from models.apartado import Apartado
+from services import areas as areas_svc
 from services import documents, path_settings
 from services import apartados as apartados_svc
-from services.apartados import CODIGO_ING, CODIGO_TRA
 
 
 
@@ -30,7 +30,7 @@ def _current_db_user():
         uid = int(g.current_user["sub"])
     except (TypeError, ValueError, KeyError):
         abort(401, "Token malformado")
-    u = g.db.query(User).options(joinedload(User.role), joinedload(User.apartados)).get(uid)
+    u = g.db.query(User).options(joinedload(User.role), joinedload(User.apartados), joinedload(User.areas)).get(uid)
     if not u:
         abort(404, "Usuario no encontrado")
     return u
@@ -66,6 +66,9 @@ def create():
         abort(403, "Solo usuarios con permiso de creación pueden dar de alta apartados")
     data = request.get_json(force=True) or {}
     try:
+        area_id = data.get("area_id")
+        if area_id is None:
+            abort(400, "area_id requerido")
         a = apartados_svc.create_apartado(
             g.db,
             codigo=(data.get("codigo") or "").strip(),
@@ -74,9 +77,10 @@ def create():
             destino_path=(data.get("destino_path") or "").strip(),
             modo_flujo=(data.get("modo_flujo") or "").strip(),
             prefijo=(data.get("prefijo") or "").strip(),
+            area_id=int(area_id),
             activo=bool(data.get("activo", True)),
             orden=data.get("orden"),
-            cod_deposito=(data.get("cod_deposito") or "2").strip() or "2",
+            cod_deposito=(data.get("cod_deposito") or "").strip(),
             depositos_config=data.get("depositos_config"),
             categorias_destino=data.get("categorias_destino"),
         )
@@ -132,12 +136,16 @@ def delete(apartado_id: int):
     if not can_gestionar_todos(perms, role):
         abort(403, "Solo usuarios con gestión total pueden eliminar apartados")
     role_name = role
-    es_super = role_name == "superadmin"
     a = apartados_svc.get_by_id(g.db, apartado_id)
     if not a:
         abort(404, "Apartado no encontrado")
-    if a.codigo in (CODIGO_TRA, CODIGO_ING) and not es_super:
-        abort(400, "No se pueden eliminar los apartados transferencias e ingresos")
+    if a.area_id and a.activo:
+        remaining = apartados_svc.count_apartados_modo_en_area(g.db, a.area_id, a.modo_flujo)
+        if remaining <= 1:
+            abort(
+                400,
+                f"No se puede eliminar el ultimo apartado de modo '{a.modo_flujo}' en esta area",
+            )
     g.db.delete(a)
     g.db.commit()
     path_settings.invalidate_cache()
@@ -151,8 +159,16 @@ def delete(apartado_id: int):
 
 
 
+@bp.route("/carpetas-disponibles", methods=["GET"])
+@require_auth("roles:gestionar")
+def carpetas_disponibles():
+    from services.digitalizado_access import listar_carpetas_disponibles
+
+    return jsonify(listar_carpetas_disponibles(g.db))
+
+
 @bp.route("/<codigo>/sincronizar-tango", methods=["POST"])
-@require_auth("documentos:listar")
+@require_auth("pendientes:ver")
 def sincronizar_tango(codigo: str):
     from datetime import date, datetime
     from zoneinfo import ZoneInfo
@@ -192,11 +208,19 @@ def sincronizar_tango(codigo: str):
         solicitante_username=user.username,
         solicitante_es_superadmin=es_super,
     )
+    generados = result.get("generados") or []
+    if generados:
+        try:
+            from services.documents import invalidate_pendientes_indice
+
+            invalidate_pendientes_indice(a.id)
+        except Exception:
+            pass
     return jsonify({"ok": True, "fecha": fecha.isoformat(), **result})
 
 
 @bp.route("/<codigo>/tango-ping", methods=["GET"])
-@require_auth("documentos:listar")
+@require_auth("pendientes:ver")
 def tango_ping_route(codigo: str):
     from core.apartado_access import apartado_codes_for_user
 
@@ -221,4 +245,4 @@ def tango_ping_route(codigo: str):
 def list_asignables():
     user, role, perms = _auth_context()
     rows = query_apartados_asignables(g.db, user, role, perms).all()
-    return jsonify([a.to_dict() for a in rows])
+    return jsonify(areas_svc.asignables_tree(g.db, rows))

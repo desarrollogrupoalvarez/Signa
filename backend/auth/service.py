@@ -4,6 +4,7 @@ from sqlalchemy.orm import Session
 
 from auth.repository import AuthRepository
 from core.jwt_utils import create_token
+from core.permissions import effective_permissions
 from core.security import verify_password
 
 logger = logging.getLogger("remitos")
@@ -26,18 +27,19 @@ class AuthService:
             logger.warning(f"LOGIN_INACTIVO | username={username}")
             raise ValueError("Cuenta desactivada. Contactá al administrador")
 
-        permissions = [p.name for p in user.role.permissions]
+        permissions = effective_permissions([p.name for p in user.role.permissions])
+        from core.apartado_access import area_codes_for_user
         from services import apartados as ap
 
         ap_codes = ap.codigos_for_jwt_user(self._db, user)
+        area_codes = sorted(area_codes_for_user(self._db, user, user.role.name))
         token = create_token({
-            # PyJWT valida que `sub` sea string (RFC 7519). Guardamos el id como string
-            # y lo parseamos a int donde corresponda.
             "sub":         str(user.id),
             "username":    user.username,
             "role":        user.role.name,
             "permissions": permissions,
             "apartados":   ap_codes,
+            "areas":       area_codes,
         })
 
         logger.info(f"LOGIN_OK | username={username} | role={user.role.name}")

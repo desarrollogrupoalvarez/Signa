@@ -47,6 +47,10 @@ class UsersRepository:
         self._db.refresh(role)
         return role
 
+    def delete_role(self, role: Role) -> None:
+        self._db.delete(role)
+        self._db.flush()
+
     def create(self, username: str, password_hash: str, role_id: int) -> User:
         user = User(username=username, password_hash=password_hash, role_id=role_id)
         self._db.add(user)

@@ -1,15 +1,19 @@
-import { Copy, FileText } from 'lucide-react'
-import { toast } from 'sonner'
-import { apiFetch } from '../api/client'
-import { displayNombreArchivo, displayPendingNombre, displaySignedNombre } from '../utils/displayDocName.js'
-import { copySignedFilePath } from '../utils/clientPath.js'
+import { useMemo } from 'react'
+import { FileText, FolderTree, LayoutList } from 'lucide-react'
+import { displayPendingNombre } from '../utils/displayDocName.js'
+import { metricsDocsToTreeDocs } from '../utils/signedFolderTree.js'
+import SignedFlatList from './SignedFlatList.jsx'
+import SignedFolderTree from './SignedFolderTree.jsx'
+import { groupApartadosByArea } from '../utils/apartadoAreas.js'
 
 export default function Sidebar({
   activeTab,
   apartadoTabsOrigins = [],
+  showPendientes = true,
   showFirmados = true,
   showMetricas = false,
   metricsDocs = [],
+  metricsSearchQ = '',
   /** Pendientes (ya filtrados) para la pestaña activa, o móvil ingresos */
   documentsForTab = [],
   /** Móvil: documentos con modo ingreso (una columna) */
@@ -21,7 +25,8 @@ export default function Sidebar({
   onPendingQChange = () => {},
   signedOrigen = 'todos',
   onSignedOrigenChange = () => {},
-  canRevealLocation = false,
+  signedViewMode = 'tree',
+  onSignedViewModeChange = () => {},
   onlyIngresosLayout = false,
   listFullWidth = false,
   selectedDoc,
@@ -31,6 +36,17 @@ export default function Sidebar({
   adminMenu,
   listLoading = false,
 }) {
+  const metricsTreeDocs = useMemo(
+    () => metricsDocsToTreeDocs(metricsDocs, apartadoTabsOrigins),
+    [metricsDocs, apartadoTabsOrigins],
+  )
+
+  const origenGrouped = useMemo(
+    () => groupApartadosByArea(apartadoTabsOrigins),
+    [apartadoTabsOrigins],
+  )
+  const multiAreaOrigen = origenGrouped.length > 1
+
   const list = onlyIngresosLayout
     ? documentsIngresoMobile
     : activeTab === 'firmados'
@@ -56,14 +72,16 @@ export default function Sidebar({
             <span className="ml-1.5">pendiente(s)</span>
           </p>
         </div>
-      ) : (
+      ) : (showPendientes || showFirmados || showMetricas) ? (
         <div className="flex gap-1 px-2 py-3 border-b border-app-border flex-shrink-0 flex-wrap">
-          <TabButton active={activeTab === 'pendientes'} onClick={() => onTabChange('pendientes')}>
-            Pendientes{' '}
-            <span className="ml-1.5 bg-accent text-white text-[10px] font-bold px-1.5 py-px rounded-full">
-              {documentsForTab.length}
-            </span>
-          </TabButton>
+          {showPendientes && (
+            <TabButton active={activeTab === 'pendientes'} onClick={() => onTabChange('pendientes')}>
+              Pendientes{' '}
+              <span className="ml-1.5 bg-accent text-white text-[10px] font-bold px-1.5 py-px rounded-full">
+                {documentsForTab.length}
+              </span>
+            </TabButton>
+          )}
           {showFirmados && (
             <TabButton active={activeTab === 'firmados'} onClick={() => onTabChange('firmados')}>
               Digitalizados
@@ -75,7 +93,7 @@ export default function Sidebar({
             </TabButton>
           )}
         </div>
-      )}
+      ) : null}
 
       {activeTab === 'pendientes' && !onlyIngresosLayout && (
         <div className="px-3 py-2 border-b border-app-border flex-shrink-0">
@@ -108,12 +126,43 @@ export default function Sidebar({
                 className="mt-0.5 w-full text-[12px] px-2 py-1.5 rounded-lg border border-app-border bg-app-bg text-app-text focus:outline-none focus:border-accent-dark"
               >
                 <option value="todos">Todos</option>
-                {apartadoTabsOrigins.map((a) => (
-                  <option key={a.codigo} value={a.codigo}>
-                    {a.nombre}
-                  </option>
-                ))}
+                {multiAreaOrigen
+                  ? origenGrouped.map((g) => (
+                      <optgroup key={g.area_id ?? g.area_codigo} label={g.area_nombre}>
+                        {(g.apartados || []).map((a) => (
+                          <option key={a.codigo} value={a.codigo}>
+                            {a.nombre}
+                          </option>
+                        ))}
+                      </optgroup>
+                    ))
+                  : apartadoTabsOrigins.map((a) => (
+                      <option key={a.codigo} value={a.codigo}>
+                        {a.nombre}
+                      </option>
+                    ))}
               </select>
+            </div>
+          </div>
+          <div className="flex items-center gap-1.5 pt-0.5">
+            <span className="text-[9px] font-bold uppercase tracking-wider text-app-muted shrink-0">
+              Vista
+            </span>
+            <div className="flex flex-1 rounded-lg border border-app-border p-0.5 bg-app-bg">
+              <ViewModeButton
+                active={signedViewMode === 'tree'}
+                onClick={() => onSignedViewModeChange('tree')}
+                title="Carpetas"
+              >
+                <FolderTree size={14} strokeWidth={2} />
+              </ViewModeButton>
+              <ViewModeButton
+                active={signedViewMode === 'flat'}
+                onClick={() => onSignedViewModeChange('flat')}
+                title="Lista reciente"
+              >
+                <LayoutList size={14} strokeWidth={2} />
+              </ViewModeButton>
             </div>
           </div>
         </div>
@@ -154,39 +203,40 @@ export default function Sidebar({
           list.length === 0 ? (
             <EmptyState tab="firmados" onlyIngresos={false} />
           ) : (
-            signedDocs.map((doc) => (
-              <SignedItem
-                key={`${doc.origen}::${doc.nombre}`}
-                doc={doc}
-                active={
-                  selectedDoc?.tipo === 'firmado' &&
-                  selectedDoc?.nombre === doc.nombre &&
-                  (selectedDoc?.origen || '') === (doc.origen || '')
-                }
-                onClick={() => onSelectSigned(doc)}
+            signedViewMode === 'flat' ? (
+              <SignedFlatList
+                docs={signedDocs}
+                selectedDoc={selectedDoc}
+                onSelectSigned={onSelectSigned}
               />
-            ))
+            ) : (
+              <SignedFolderTree
+                docs={signedDocs}
+                searchQuery={signedQ}
+                selectedDoc={selectedDoc}
+                onSelectSigned={onSelectSigned}
+              />
+            )
           )
         ) : activeTab === 'metricas' ? (
-          metricsDocs.length === 0 ? (
+          metricsTreeDocs.length === 0 ? (
             <div className="py-10 text-center text-app-muted text-[13px]">
               <FileText size={40} strokeWidth={1.5} className="mx-auto mb-3 opacity-30" />
               <p>Registros</p>
               <p className="text-[12px] mt-1">Sin PDFs generados para mostrar aquí.</p>
             </div>
           ) : (
-            <div className="space-y-1">
+            <div>
               <div className="px-2 pb-2">
                 <div className="text-[10px] font-extrabold tracking-widest uppercase text-app-muted">Archivos leídos</div>
-                <div className="text-[12px] text-app-muted mt-1">{metricsDocs.length} archivo(s)</div>
+                <div className="text-[12px] text-app-muted mt-1">{metricsTreeDocs.length} archivo(s)</div>
               </div>
-              {metricsDocs.map((d, idx) => (
-                <MetricDocItem
-                  key={`${d.apartado}::${d.archivo}::${idx}`}
-                  doc={d}
-                  canRevealLocation={canRevealLocation}
-                />
-              ))}
+              <SignedFolderTree
+                docs={metricsTreeDocs}
+                searchQuery={metricsSearchQ}
+                selectedDoc={selectedDoc}
+                onSelectSigned={onSelectSigned}
+              />
             </div>
           )
         ) : list.length === 0 ? (
@@ -206,25 +256,22 @@ export default function Sidebar({
   )
 }
 
-function MetricDocItem({ doc, canRevealLocation = false }) {
+function ViewModeButton({ active, onClick, title, children }) {
   return (
-    <div className="px-3 py-3 rounded-card border border-transparent hover:bg-app-surface2 hover:border-app-border transition-all">
-      <div className="flex items-center gap-2">
-        <div className="flex-1 min-w-0 text-[12px] font-semibold truncate text-app-text">
-          {displayNombreArchivo(doc?.archivo) || '—'}
-        </div>
-        {canRevealLocation && doc?.nombre_firmado && (
-          <button
-            type="button"
-            title="Copiar ruta de archivo"
-            className="shrink-0 p-1 rounded-md border border-app-border bg-app-bg text-app-muted hover:text-app-text hover:border-app-muted"
-            onClick={() => copySignedFilePath(doc.nombre_firmado, { apiFetch, toast })}
-          >
-            <Copy size={16} strokeWidth={1.75} />
-          </button>
-        )}
-      </div>
-    </div>
+    <button
+      type="button"
+      onClick={onClick}
+      title={title}
+      aria-label={title}
+      className={[
+        'flex-1 flex items-center justify-center py-1.5 rounded-md transition-colors',
+        active
+          ? 'bg-accent/15 text-accent-dark'
+          : 'text-app-muted hover:text-app-text hover:bg-app-surface2',
+      ].join(' ')}
+    >
+      {children}
+    </button>
   )
 }
 
@@ -265,33 +312,6 @@ function PendingItem({ doc, active, onClick }) {
       <div className={['text-[12px] font-semibold mb-1 truncate', active ? 'text-accent-dark' : 'text-app-text'].join(' ')}>
         <span className="inline-block w-1.5 h-1.5 rounded-full bg-accent mr-1.5 mb-px animate-pulse-dot" />
         {displayPendingNombre(doc)}
-      </div>
-      <div className="text-[10px] text-app-muted font-mono">{date}</div>
-    </div>
-  )
-}
-
-function SignedItem({ doc, active, onClick }) {
-  const date = new Date(doc.modificado_en).toLocaleString('es-AR', {
-    day: '2-digit',
-    month: '2-digit',
-    year: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-  })
-  const shortName = displaySignedNombre(doc)
-  return (
-    <div
-      onClick={onClick}
-      className={[
-        'px-3 py-3 rounded-card border cursor-pointer transition-all mb-1 select-none',
-        active
-          ? 'bg-accent/10 border-accent-dark'
-          : 'border-transparent hover:bg-app-surface2 hover:border-app-border',
-      ].join(' ')}
-    >
-      <div className={['text-[12px] font-semibold mb-1 truncate', active ? 'text-accent-dark' : 'text-app-text'].join(' ')}>
-        {shortName}
       </div>
       <div className="text-[10px] text-app-muted font-mono">{date}</div>
     </div>

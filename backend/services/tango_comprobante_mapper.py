@@ -337,15 +337,35 @@ def resolve_output_path(bandeja: Path, preferred_name: str) -> Path:
     raise OSError(f"No se pudo obtener nombre único para {preferred_name}")
 
 
-def generar_pdf_transferencia(datos: dict[str, Any], bandeja: Path, header_row: Mapping[str, Any]) -> Path:
+def generar_pdf_transferencia(
+    datos: dict[str, Any],
+    bandeja: Path,
+    header_row: Mapping[str, Any],
+    *,
+    comprobante_id: int | None = None,
+) -> Path:
     preferred = filename_transferencia(header_row)
     out = resolve_output_path(bandeja, preferred)
-    generar_transferencia_pdf(datos_transferencia_desde_dict(datos), out)
+    generar_transferencia_pdf(
+        datos_transferencia_desde_dict(datos),
+        out,
+        comprobante_id=comprobante_id,
+    )
     return out
 
 
-def generar_pdf_ingreso(datos: dict[str, Any], bandeja: Path, header_row: Mapping[str, Any]) -> Path:
+def generar_pdf_ingreso(
+    datos: dict[str, Any],
+    bandeja: Path,
+    header_row: Mapping[str, Any],
+    *,
+    comprobante_id: int | None = None,
+) -> Path:
     preferred = filename_ingreso(header_row)
     out = resolve_output_path(bandeja, preferred)
-    generar_recepcion_pdf(datos_recepcion_desde_dict(datos), out)
+    generar_recepcion_pdf(
+        datos_recepcion_desde_dict(datos),
+        out,
+        comprobante_id=comprobante_id,
+    )
     return out

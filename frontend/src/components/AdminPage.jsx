@@ -2,6 +2,14 @@ import { useEffect, useMemo, useState } from 'react'
 import { Eye, EyeOff, Save, Trash2, UserX } from 'lucide-react'
 import { toast } from 'sonner'
 import { apiFetch } from '../api/client'
+import {
+  buildAreaApartadoPayload,
+  initAreaApartadoSelection,
+  isAreaFullyChecked,
+  isAreaPartiallyChecked,
+  toggleApartadoSelection,
+  toggleAreaSelection,
+} from '../utils/apartadoAreas.js'
 
 const TANGO_FUENTE_OPTIONS = [
   { id: 'SAN_RAFAEL', label: 'SAN_RAFAEL (Agro)' },
@@ -24,7 +32,7 @@ function makeDeposito(overrides = {}) {
   return {
     carpeta: '',
     tango_fuente: 'SAN_RAFAEL',
-    cod_depositos: '2',
+    cod_depositos: '',
     categorias: cloneCategorias(DEFAULT_CATEGORIAS_TRANSFERENCIA),
     ...overrides,
   }
@@ -54,14 +62,16 @@ function depositosFromApartado(apartado) {
     return rows.map((d) => ({
       carpeta: d.carpeta || '',
       tango_fuente: d.tango_fuente || 'SAN_RAFAEL',
-      cod_depositos: Array.isArray(d.cod_depositos) ? d.cod_depositos.join(',') : String(d.cod_depositos || '2'),
+      cod_depositos: Array.isArray(d.cod_depositos)
+        ? d.cod_depositos.join(',')
+        : String(d.cod_depositos ?? '').trim(),
       categorias:
         Array.isArray(d.categorias) && d.categorias.length > 0
           ? cloneCategorias(d.categorias)
           : cloneCategorias(fallbackCats),
     }))
   }
-  const cod = (apartado?.cod_deposito || '2').trim() || '2'
+  const cod = (apartado?.cod_deposito || '').trim()
   return DEFAULT_DEPOSITOS.map((d) => ({ ...d, cod_depositos: cod, categorias: cloneCategorias(fallbackCats) }))
 }
 
@@ -70,7 +80,7 @@ function depositosToPayload(rows, { incluirCategorias = false } = {}) {
     const item = {
       carpeta: (d.carpeta || '').trim(),
       tango_fuente: (d.tango_fuente || '').trim(),
-      cod_depositos: (d.cod_depositos || '2')
+      cod_depositos: String(d.cod_depositos ?? '')
         .split(/[,;]+/)
         .map((x) => x.trim())
         .filter(Boolean),
@@ -94,6 +104,52 @@ function categoriasToPayload(rows) {
 function apartadoAssignLabel(a) {
   const nombre = (a?.nombre || '').trim()
   return nombre || a?.codigo || ''
+}
+
+function AreaApartadoAssignTree({ areaTree = [], areaIds, apartadoIds, onChange, disabled = false }) {
+  if (!areaTree.length) {
+    return <span className="text-[12px] text-app-muted">No hay areas disponibles.</span>
+  }
+  return (
+    <div className="space-y-2">
+      {areaTree.map((area) => {
+        const full = isAreaFullyChecked(area, areaIds, apartadoIds)
+        const partial = isAreaPartiallyChecked(area, areaIds, apartadoIds)
+        return (
+          <div key={area.id ?? area.codigo} className="rounded-lg border border-app-border bg-app-bg p-2.5">
+            <label className="flex items-center gap-2 text-[12px] font-semibold text-app-text">
+              <input
+                type="checkbox"
+                checked={full}
+                ref={(el) => {
+                  if (el) el.indeterminate = partial && !full
+                }}
+                disabled={disabled}
+                onChange={() => onChange(toggleAreaSelection(area, areaIds, apartadoIds))}
+              />
+              <span>{area.nombre || area.codigo}</span>
+            </label>
+            <div className="mt-2 ml-5 flex flex-wrap gap-2">
+              {(area.apartados || []).map((a) => (
+                <label
+                  key={a.id}
+                  className="flex items-center gap-1.5 text-[12px] text-app-text border border-app-border rounded-lg px-2 py-1 bg-app-surface2"
+                >
+                  <input
+                    type="checkbox"
+                    checked={apartadoIds.has(Number(a.id))}
+                    disabled={disabled}
+                    onChange={() => onChange(toggleApartadoSelection(a, area, areaIds, apartadoIds))}
+                  />
+                  <span title={a.codigo}>{apartadoAssignLabel(a)}</span>
+                </label>
+              ))}
+            </div>
+          </div>
+        )
+      })}
+    </div>
+  )
 }
 
 function canManageUsers(perms = []) {
@@ -120,6 +176,68 @@ function canEditarApartados(perms = []) {
   return canGestionarApartados(perms) || perms.includes('apartados:editar')
 }
 
+const RESERVED_ROLES = new Set(['superadmin', 'firmante', 'consulta', 'administrador'])
+
+const VIEW_SECTIONS = [
+  {
+    id: 'pendientes',
+    label: 'Pendientes',
+    match: (name) => name.startsWith('pendientes:'),
+  },
+  {
+    id: 'digitalizados',
+    label: 'Digitalizados',
+    match: (name) => name.startsWith('digitalizados:'),
+  },
+  {
+    id: 'registros',
+    label: 'Registros',
+    match: (name) => name.startsWith('registros:'),
+  },
+  {
+    id: 'usuarios',
+    label: 'Usuarios',
+    match: (name) => name.startsWith('usuarios:'),
+  },
+  {
+    id: 'roles',
+    label: 'Roles',
+    match: (name) => name.startsWith('roles:'),
+  },
+  {
+    id: 'apartados',
+    label: 'Apartados',
+    match: (name) => name.startsWith('apartados:'),
+  },
+  {
+    id: 'configuracion',
+    label: 'Configuración',
+    match: (name) => name.startsWith('configuracion:'),
+  },
+]
+
+function carpetaKey(apartadoId, carpeta, categoria = '') {
+  return `${apartadoId}::${(carpeta || '').trim()}::${(categoria || '').trim()}`
+}
+
+function carpetaKeyFromItem(item) {
+  return carpetaKey(item.apartado_id, item.carpeta, item.categoria || '')
+}
+
+function itemsFromCarpetaKeys(keys, carpetasDisponibles) {
+  const out = []
+  for (const key of keys) {
+    const [apId, carpeta, categoria] = key.split('::')
+    if (!apId || !carpeta) continue
+    out.push({
+      apartado_id: Number(apId),
+      carpeta,
+      ...(categoria ? { categoria } : {}),
+    })
+  }
+  return out
+}
+
 export default function AdminPage({ currentUser, section = 'rutas' }) {
   const permissions = currentUser?.permissions || []
   const allowUsers = canManageUsers(permissions)
@@ -128,6 +246,7 @@ export default function AdminPage({ currentUser, section = 'rutas' }) {
   const allowApartadosPaths = canEditarApartados(permissions) || allowPaths
   const allowApartadosCrear = canCrearApartados(permissions)
   const allowApartadosLista = allowApartadosCrear || canEditarApartados(permissions)
+  const allowAreasGestion = canGestionarApartados(permissions)
   const canEditApartadoAssign = permissions.includes('usuarios:editar')
 
   const [loading, setLoading] = useState(false)
@@ -136,6 +255,7 @@ export default function AdminPage({ currentUser, section = 'rutas' }) {
   const [perms, setPerms] = useState([])
   const [apartadosList, setApartadosList] = useState([])
   const [apartadosAdmin, setApartadosAdmin] = useState([])
+  const [areasAdmin, setAreasAdmin] = useState([])
 
   const roleOptions = useMemo(() => roles.map((r) => r.name), [roles])
 
@@ -149,6 +269,9 @@ export default function AdminPage({ currentUser, section = 'rutas' }) {
       }
       if (allowApartadosLista || allowApartadosPaths) {
         reqs.push(apiFetch('/api/apartados').then((r) => r.json()).then(setApartadosAdmin))
+      }
+      if (allowAreasGestion || allowApartadosCrear) {
+        reqs.push(apiFetch('/api/areas').then((r) => r.json()).then(setAreasAdmin))
       }
       if (allowRoles) {
         reqs.push(apiFetch('/api/roles').then((r) => r.json()).then(setRoles))
@@ -173,7 +296,9 @@ export default function AdminPage({ currentUser, section = 'rutas' }) {
         ? 'admin-rutas'
         : section === 'apartados'
           ? 'admin-apartados'
-          : section === 'usuarios'
+          : section === 'areas'
+            ? 'admin-areas'
+            : section === 'usuarios'
             ? 'admin-usuarios'
             : section === 'roles'
               ? 'admin-roles'
@@ -210,11 +335,15 @@ export default function AdminPage({ currentUser, section = 'rutas' }) {
 
         {allowApartadosPaths && <ApartadoPathsPanel />}
 
+        {allowAreasGestion && (
+          <AreasPanel onSaved={() => refreshAll()} initialRows={areasAdmin} canDelete={allowAreasGestion} />
+        )}
+
         {allowApartadosLista && (
           <ApartadosPanel
             onSaved={() => refreshAll()}
             initialRows={apartadosAdmin}
-            currentUser={currentUser}
+            areas={areasAdmin}
             canCreate={allowApartadosCrear}
             canDelete={canGestionarApartados(permissions)}
           />
@@ -236,8 +365,10 @@ export default function AdminPage({ currentUser, section = 'rutas' }) {
           <RolesPanel
             roles={roles}
             perms={perms}
+            canDeleteRoles={permissions.includes('roles:eliminar')}
             onCreated={() => refreshAll()}
             onUpdated={() => refreshAll()}
+            onDeleted={() => refreshAll()}
           />
         )}
       </div>
@@ -401,7 +532,8 @@ function ApartadoPathsPanel() {
                       })
                     }
                     disabled={loading}
-                    placeholder="Cód. Tango"
+                    placeholder="Todos si vacío"
+                    title="Vacío = todos los depósitos. Varios: 2,5"
                     spellCheck={false}
                   />
                   <button
@@ -565,10 +697,140 @@ function ApartadoPathsPanel() {
   )
 }
 
-const CODIGOS_APARTADO_RESERVADOS = ['transferencias', 'ingresos']
 
-function ApartadosPanel({ onSaved, initialRows, currentUser, canCreate = false, canDelete = false }) {
-  const isSuperadmin = currentUser?.role === 'superadmin'
+function AreasPanel({ onSaved, initialRows = [], canDelete = false }) {
+  const [rows, setRows] = useState(initialRows || [])
+  const [editNames, setEditNames] = useState({})
+  const [editActivo, setEditActivo] = useState({})
+  const [savingId, setSavingId] = useState(null)
+  const [deletingId, setDeletingId] = useState(null)
+  const [saving, setSaving] = useState(false)
+  const [form, setForm] = useState({ codigo: '', nombre: '' })
+
+  useEffect(() => {
+    const list = initialRows || []
+    setRows(list)
+    const names = {}
+    const activos = {}
+    for (const a of list) {
+      names[a.id] = a.nombre || ''
+      activos[a.id] = a.activo !== false
+    }
+    setEditNames(names)
+    setEditActivo(activos)
+  }, [initialRows])
+
+  async function saveRow(area) {
+    const nombre = (editNames[area.id] ?? area.nombre ?? '').trim()
+    if (!nombre) {
+      toast.error('El nombre no puede estar vacio')
+      return
+    }
+    setSavingId(area.id)
+    try {
+      await apiFetch(`/api/areas/${area.id}`, {
+        method: 'PUT',
+        body: JSON.stringify({ nombre, activo: editActivo[area.id] !== false }),
+      })
+      toast.success('Area actualizada')
+      onSaved?.()
+    } catch (e) {
+      toast.error(e.message)
+    } finally {
+      setSavingId(null)
+    }
+  }
+
+  async function deleteRow(area) {
+    if (!window.confirm(`Eliminar el deposito «${area.nombre || area.codigo}»?`)) return
+    setDeletingId(area.id)
+    try {
+      await apiFetch(`/api/areas/${area.id}`, { method: 'DELETE' })
+      toast.success('Area eliminada')
+      onSaved?.()
+    } catch (e) {
+      toast.error(e.message)
+    } finally {
+      setDeletingId(null)
+    }
+  }
+
+  async function createArea(e) {
+    e.preventDefault()
+    setSaving(true)
+    try {
+      await apiFetch('/api/areas', {
+        method: 'POST',
+        body: JSON.stringify({
+          codigo: form.codigo.trim(),
+          nombre: form.nombre.trim() || form.codigo.trim(),
+        }),
+      })
+      toast.success('Area creada')
+      setForm({ codigo: '', nombre: '' })
+      onSaved?.()
+    } catch (e2) {
+      toast.error(e2.message)
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return (
+    <section id="admin-areas" className="bg-app-surface border border-app-border rounded-2xl shadow-card overflow-hidden">
+      <div className="px-4 py-3 border-b border-app-border">
+        <div className="text-[12px] font-extrabold tracking-widest uppercase text-app-text">Areas / Depositos</div>
+      </div>
+      <div className="p-4 space-y-4">
+        <form onSubmit={createArea} className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+          <Field label="Codigo (slug)">
+            <input className={inputCls} value={form.codigo} onChange={(e) => setForm((f) => ({ ...f, codigo: e.target.value }))} placeholder="daudet" spellCheck={false} />
+          </Field>
+          <Field label="Nombre visible">
+            <input className={inputCls} value={form.nombre} onChange={(e) => setForm((f) => ({ ...f, nombre: e.target.value }))} placeholder="Deposito Daudet" />
+          </Field>
+          <div className="sm:col-span-2 flex justify-end">
+            <button type="submit" disabled={saving || !form.codigo.trim()} className="px-4 py-2 rounded-card text-[12px] font-bold text-white bg-teal-600 hover:bg-teal-500 disabled:opacity-50">
+              {saving ? 'Guardando…' : 'Crear area'}
+            </button>
+          </div>
+        </form>
+
+        <div className="border-t border-app-border pt-4 space-y-2">
+          {rows.length === 0 ? (
+            <p className="text-[13px] text-app-muted">No hay areas cargadas.</p>
+          ) : (
+            rows.map((area) => (
+              <div key={area.id} className="flex flex-col sm:flex-row sm:items-center gap-2 p-3 rounded-card bg-app-surface2 border border-app-border">
+                <div className="min-w-0 flex-1 grid grid-cols-1 sm:grid-cols-12 gap-2 items-center">
+                  <div className="sm:col-span-3 text-[12px] font-mono text-app-muted truncate" title={area.codigo}>{area.codigo}</div>
+                  <input className={`${inputCls} sm:col-span-5`} value={editNames[area.id] ?? ''} onChange={(e) => setEditNames((m) => ({ ...m, [area.id]: e.target.value }))} placeholder="Nombre visible" spellCheck={false} />
+                  <span className="sm:col-span-2 text-[11px] text-app-muted">{(area.apartados || []).length} apartado(s)</span>
+                  <label className="sm:col-span-2 flex items-center gap-1.5 text-[12px] cursor-pointer">
+                    <input type="checkbox" checked={editActivo[area.id] !== false} onChange={(e) => setEditActivo((m) => ({ ...m, [area.id]: e.target.checked }))} className="rounded border-app-border" />
+                    Activo
+                  </label>
+                </div>
+                <div className="flex gap-2">
+                  <button type="button" disabled={savingId === area.id || deletingId === area.id} onClick={() => saveRow(area)} className="px-3 py-1.5 rounded-card text-[11px] font-bold text-white bg-teal-600 hover:bg-teal-500 disabled:opacity-50">
+                    {savingId === area.id ? 'Guardando…' : 'Guardar'}
+                  </button>
+                  {canDelete && (
+                    <button type="button" disabled={savingId === area.id || deletingId === area.id} onClick={() => deleteRow(area)} className="h-9 w-9 grid place-items-center rounded-card text-red-700 bg-red-50 border border-red-200 hover:border-red-300 disabled:opacity-50">
+                      <Trash2 size={16} />
+                    </button>
+                  )}
+                </div>
+              </div>
+            ))
+          )}
+        </div>
+      </div>
+    </section>
+  )
+}
+
+function ApartadosPanel({ onSaved, initialRows, areas = [], canCreate = false, canDelete = false }) {
   const [rows, setRows] = useState(initialRows || [])
   const [editNames, setEditNames] = useState({})
   const [editActivo, setEditActivo] = useState({})
@@ -582,8 +844,26 @@ function ApartadosPanel({ onSaved, initialRows, currentUser, canCreate = false, 
     destino_path: '',
     modo_flujo: 'transferencia',
     prefijo: '',
-    cod_deposito: '2',
+    cod_deposito: '',
+    area_id: '',
   })
+
+  useEffect(() => {
+    if (!form.area_id && areas?.[0]?.id) {
+      setForm((f) => ({ ...f, area_id: String(areas[0].id) }))
+    }
+  }, [areas, form.area_id])
+
+  const rowsByArea = useMemo(() => {
+    const map = new Map()
+    for (const a of rows) {
+      const key = a.area_id ?? 'sin'
+      const label = a.area_nombre || 'Sin area'
+      if (!map.has(key)) map.set(key, { label, items: [] })
+      map.get(key).items.push(a)
+    }
+    return [...map.values()]
+  }, [rows])
 
   useEffect(() => {
     const list = initialRows || []
@@ -623,14 +903,7 @@ function ApartadosPanel({ onSaved, initialRows, currentUser, canCreate = false, 
   }
 
   async function deleteApartadoRow(apartado) {
-    const reservado = CODIGOS_APARTADO_RESERVADOS.includes(apartado.codigo)
-    if (reservado && !isSuperadmin) {
-      toast.error('Solo superadmin puede eliminar transferencias o ingresos')
-      return
-    }
-    const msg = reservado
-      ? `¿Eliminar el apartado reservado «${apartado.codigo}»? La app dejará de usar ese flujo hasta recrearlo.`
-      : `¿Eliminar el apartado «${apartado.nombre || apartado.codigo}» de la base de datos?`
+    const msg = `¿Eliminar el apartado «${apartado.nombre || apartado.codigo}» de la base de datos?`
     if (!window.confirm(msg)) return
     setDeletingId(apartado.id)
     try {
@@ -657,6 +930,8 @@ function ApartadosPanel({ onSaved, initialRows, currentUser, canCreate = false, 
           destino_path: form.destino_path.trim(),
           modo_flujo: form.modo_flujo,
           prefijo: form.prefijo.trim(),
+          area_id: Number(form.area_id),
+          cod_deposito: form.cod_deposito.trim(),
           depositos_config: depositosToPayload(DEFAULT_DEPOSITOS, {
             incluirCategorias: form.modo_flujo === 'transferencia',
           }),
@@ -670,7 +945,8 @@ function ApartadosPanel({ onSaved, initialRows, currentUser, canCreate = false, 
         destino_path: '',
         modo_flujo: 'transferencia',
         prefijo: '',
-        cod_deposito: '2',
+        cod_deposito: '',
+        area_id: areas?.[0]?.id ? String(areas[0].id) : '',
       })
       onSaved?.()
     } catch (e2) {
@@ -688,6 +964,14 @@ function ApartadosPanel({ onSaved, initialRows, currentUser, canCreate = false, 
       <div className="p-4 space-y-4">
         {canCreate && (
         <form onSubmit={createApartado} className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2.5">
+          <Field label="Area / Deposito">
+            <select className={inputCls} value={form.area_id} onChange={(e) => setForm((f) => ({ ...f, area_id: e.target.value }))} required>
+              <option value="">Seleccionar…</option>
+              {(areas || []).map((ar) => (
+                <option key={ar.id} value={ar.id}>{ar.nombre || ar.codigo}</option>
+              ))}
+            </select>
+          </Field>
           <Field label="Código (slug)">
             <input className={inputCls} value={form.codigo} onChange={(e) => setForm((f) => ({ ...f, codigo: e.target.value }))} placeholder="AAA_001" spellCheck={false} />
           </Field>
@@ -699,7 +983,8 @@ function ApartadosPanel({ onSaved, initialRows, currentUser, canCreate = false, 
               className={inputCls}
               value={form.cod_deposito}
               onChange={(e) => setForm((f) => ({ ...f, cod_deposito: e.target.value }))}
-              placeholder="2"
+              placeholder="Vacío = todos"
+              title="Vacío = todos los depósitos en Registros (fallback). Preferí configurar por depósito en Rutas."
               spellCheck={false}
             />
           </Field>
@@ -721,7 +1006,7 @@ function ApartadosPanel({ onSaved, initialRows, currentUser, canCreate = false, 
           <div className="sm:col-span-2 lg:col-span-3 flex justify-end">
             <button
               type="submit"
-              disabled={saving || !form.codigo.trim() || !form.prefijo.trim() || !form.bandeja_path.trim() || !form.destino_path.trim()}
+              disabled={saving || !form.codigo.trim() || !form.prefijo.trim() || !form.bandeja_path.trim() || !form.destino_path.trim() || !form.area_id}
               className="px-4 py-2 rounded-card text-[12px] font-bold text-white bg-teal-600 hover:bg-teal-500 disabled:opacity-50"
             >
               {saving ? 'Guardando…' : 'Crear apartado'}
@@ -737,11 +1022,14 @@ function ApartadosPanel({ onSaved, initialRows, currentUser, canCreate = false, 
           {rows.length === 0 ? (
             <p className="text-[13px] text-app-muted">No hay apartados cargados.</p>
           ) : (
-            <div className="space-y-2">
-              {rows.map((a) => {
-                const reservado = CODIGOS_APARTADO_RESERVADOS.includes(a.codigo)
-                const canDeleteRow = canDelete && (!reservado || isSuperadmin)
-                return (
+            <div className="space-y-4">
+              {rowsByArea.map((group) => (
+                <div key={group.label}>
+                  <div className="text-[11px] font-extrabold tracking-widest uppercase text-app-muted mb-2">{group.label}</div>
+                  <div className="space-y-2">
+                    {group.items.map((a) => {
+                      const canDeleteRow = canDelete
+                      return (
                   <div
                     key={a.id}
                     className="flex flex-col sm:flex-row sm:items-center gap-2 p-3 rounded-card bg-app-surface2 border border-app-border"
@@ -749,9 +1037,6 @@ function ApartadosPanel({ onSaved, initialRows, currentUser, canCreate = false, 
                     <div className="min-w-0 flex-1 grid grid-cols-1 sm:grid-cols-12 gap-2 items-center">
                       <div className="sm:col-span-3 text-[12px] font-mono text-app-muted truncate" title={a.codigo}>
                         {a.codigo}
-                        {reservado && (
-                          <span className="ml-1 text-[10px] uppercase text-amber-600 font-bold">reservado</span>
-                        )}
                       </div>
                       <input
                         className={`${inputCls} sm:col-span-4`}
@@ -797,14 +1082,17 @@ function ApartadosPanel({ onSaved, initialRows, currentUser, canCreate = false, 
                       )}
                     </div>
                   </div>
-                )
-              })}
+                      )
+                    })}
+                  </div>
+                </div>
+              ))}
             </div>
           )}
           <p className="text-[11px] text-app-muted mt-2">
             {canCreate
-              ? 'El código y las rutas detalladas se editan en «Rutas de archivos». Como superadmin podés eliminar apartados reservados.'
-              : 'El código y las rutas se editan en «Rutas de archivos». Solo podés modificar apartados asignados a tu usuario.'}
+              ? 'El codigo y las rutas detalladas se editan en «Rutas de archivos». Cada apartado pertenece a un area/deposito.'
+              : 'El codigo y las rutas se editan en «Rutas de archivos». Solo podes modificar apartados asignados a tu usuario.'}
           </p>
         </div>
       </div>
@@ -814,7 +1102,7 @@ function ApartadosPanel({ onSaved, initialRows, currentUser, canCreate = false, 
 
 function UsersPanel({ users, roleOptions, apartadosList = [], canEditApartadoAssign, onCreated, onUpdated, onDeactivated }) {
   const [form, setForm] = useState({ username: '', password: '', role: roleOptions[0] || '' })
-  const [createApartados, setCreateApartados] = useState(new Set())
+  const [createSelection, setCreateSelection] = useState({ areaIds: new Set(), apartadoIds: new Set() })
   const [saving, setSaving] = useState(false)
   const [showCreatePass, setShowCreatePass] = useState(false)
   const [selectedUserId, setSelectedUserId] = useState('')
@@ -840,12 +1128,14 @@ function UsersPanel({ users, roleOptions, apartadosList = [], canEditApartadoAss
         method: 'POST',
         body: JSON.stringify({
           ...form,
-          ...(canEditApartadoAssign ? { apartado_ids: [...createApartados] } : {}),
+          ...(canEditApartadoAssign
+            ? buildAreaApartadoPayload(createSelection.areaIds, createSelection.apartadoIds)
+            : {}),
         }),
       })
       toast.success('Usuario creado')
       setForm({ username: '', password: '', role: roleOptions[0] || '' })
-      setCreateApartados(new Set())
+      setCreateSelection({ areaIds: new Set(), apartadoIds: new Set() })
       onCreated?.()
     } catch (e2) {
       toast.error(e2.message)
@@ -936,33 +1226,14 @@ function UsersPanel({ users, roleOptions, apartadosList = [], canEditApartadoAss
             </Field>
             {canEditApartadoAssign && (
               <div className="sm:col-span-2 space-y-1">
-                <div className="text-[11px] font-extrabold tracking-widest uppercase text-app-muted">Apartados</div>
-                <div className="flex flex-wrap gap-2">
-                  {(apartadosList || []).map((a) => (
-                    <label
-                      key={a.id}
-                      className="flex items-center gap-1.5 text-[12px] text-app-text border border-app-border rounded-lg px-2 py-1 bg-app-bg"
-                    >
-                      <input
-                        type="checkbox"
-                        checked={createApartados.has(a.id)}
-                        onChange={() =>
-                          setCreateApartados((s) => {
-                            const n = new Set(s)
-                            if (n.has(a.id)) n.delete(a.id)
-                            else n.add(a.id)
-                            return n
-                          })
-                        }
-                        disabled={saving}
-                      />
-                      <span title={a.codigo}>{apartadoAssignLabel(a)}</span>
-                    </label>
-                  ))}
-                  {apartadosList.length === 0 && (
-                    <span className="text-[12px] text-app-muted">No hay apartados disponibles.</span>
-                  )}
-                </div>
+                <div className="text-[11px] font-extrabold tracking-widest uppercase text-app-muted">Areas y apartados</div>
+                <AreaApartadoAssignTree
+                  areaTree={apartadosList}
+                  areaIds={createSelection.areaIds}
+                  apartadoIds={createSelection.apartadoIds}
+                  disabled={saving}
+                  onChange={({ areaIds, apartadoIds }) => setCreateSelection({ areaIds, apartadoIds })}
+                />
               </div>
             )}
           </div>
@@ -1023,28 +1294,20 @@ function UserRow({ user, roleOptions, apartadosList = [], canEditApartadoAssign,
   const [role, setRole] = useState(user.role || '')
   const [password, setPassword] = useState('')
   const [showNewPass, setShowNewPass] = useState(false)
-  const [apartadoIds, setApartadoIds] = useState(new Set((user.apartado_ids || []).map(Number)))
+  const [selection, setSelection] = useState(() => initAreaApartadoSelection(user, apartadosList))
 
   useEffect(() => {
-    setApartadoIds(new Set((user.apartado_ids || []).map(Number)))
-  }, [user.id, (user.apartado_ids || []).join(',')])
+    setSelection(initAreaApartadoSelection(user, apartadosList))
+  }, [user.id, (user.apartado_ids || []).join(','), (user.area_ids || []).join(','), apartadosList])
 
   const superUser = user.role === 'superadmin'
+  const payload = buildAreaApartadoPayload(selection.areaIds, selection.apartadoIds)
   const dirtyAp =
     canEditApartadoAssign &&
     !superUser &&
-    (user.apartado_ids || []).slice().sort().join() !==
-      [...apartadoIds].sort().join()
+    ((user.apartado_ids || []).slice().sort().join() !== payload.apartado_ids.slice().sort().join() ||
+      (user.area_ids || []).slice().sort().join() !== payload.area_ids.slice().sort().join())
   const dirty = role !== (user.role || '') || !!password || dirtyAp
-
-  function toggleAp(id) {
-    setApartadoIds((s) => {
-      const n = new Set(s)
-      if (n.has(id)) n.delete(id)
-      else n.add(id)
-      return n
-    })
-  }
 
   return (
     <div className="p-3">
@@ -1065,7 +1328,7 @@ function UserRow({ user, roleOptions, apartadosList = [], canEditApartadoAssign,
                 const patch = { role }
                 if (password) patch.password = password
                 if (dirtyAp && canEditApartadoAssign && !superUser) {
-                  patch.apartado_ids = [...apartadoIds]
+                  Object.assign(patch, buildAreaApartadoPayload(selection.areaIds, selection.apartadoIds))
                 }
                 onUpdate(patch)
                 setPassword('')
@@ -1121,26 +1384,17 @@ function UserRow({ user, roleOptions, apartadosList = [], canEditApartadoAssign,
 
           {canEditApartadoAssign && (
             <div className="sm:col-span-2 space-y-1.5">
-              <div className="text-[11px] font-extrabold tracking-widest uppercase text-app-muted">Apartados</div>
+              <div className="text-[11px] font-extrabold tracking-widest uppercase text-app-muted">Areas y apartados</div>
               {superUser ? (
-                <p className="text-[12px] text-app-muted">Superadmin: acceso a todos (sin asignación).</p>
+                <p className="text-[12px] text-app-muted">Superadmin: acceso a todos (sin asignacion).</p>
               ) : (
-                <div className="flex flex-wrap gap-2">
-                  {(apartadosList || []).map((a) => (
-                    <label
-                      key={a.id}
-                      className="flex items-center gap-1.5 text-[12px] text-app-text border border-app-border rounded-lg px-2 py-1 bg-app-bg"
-                    >
-                      <input
-                        type="checkbox"
-                        checked={apartadoIds.has(a.id)}
-                        onChange={() => toggleAp(a.id)}
-                        disabled={disabled}
-                      />
-                      <span title={a.codigo}>{apartadoAssignLabel(a)}</span>
-                    </label>
-                  ))}
-                </div>
+                <AreaApartadoAssignTree
+                  areaTree={apartadosList}
+                  areaIds={selection.areaIds}
+                  apartadoIds={selection.apartadoIds}
+                  disabled={disabled}
+                  onChange={setSelection}
+                />
               )}
             </div>
           )}
@@ -1151,12 +1405,14 @@ function UserRow({ user, roleOptions, apartadosList = [], canEditApartadoAssign,
   )
 }
 
-function RolesPanel({ roles, perms, onCreated, onUpdated }) {
+function RolesPanel({ roles, perms, canDeleteRoles, onCreated, onUpdated, onDeleted }) {
   const [mode, setMode] = useState('edit')
   const [selectedRoleId, setSelectedRoleId] = useState(roles[0]?.id || '')
   const [saving, setSaving] = useState(false)
+  const [deleting, setDeleting] = useState(false)
 
   const selectedRole = useMemo(() => roles.find((r) => String(r.id) === String(selectedRoleId)), [roles, selectedRoleId])
+  const canDeleteSelected = canDeleteRoles && selectedRole && !RESERVED_ROLES.has(selectedRole.name)
 
   useEffect(() => {
     if (!selectedRoleId && roles[0]?.id) setSelectedRoleId(roles[0].id)
@@ -1168,6 +1424,7 @@ function RolesPanel({ roles, perms, onCreated, onUpdated }) {
       await apiFetch('/api/roles', { method: 'POST', body: JSON.stringify(payload) })
       toast.success('Rol creado')
       onCreated?.()
+      setMode('edit')
     } catch (e2) {
       toast.error(e2.message)
     } finally {
@@ -1188,23 +1445,40 @@ function RolesPanel({ roles, perms, onCreated, onUpdated }) {
     }
   }
 
+  async function deleteRole(roleId) {
+    if (!window.confirm('¿Eliminar este rol? Esta acción no se puede deshacer.')) return
+    setDeleting(true)
+    try {
+      await apiFetch(`/api/roles/${roleId}`, { method: 'DELETE' })
+      toast.success('Rol eliminado')
+      setSelectedRoleId('')
+      onDeleted?.()
+    } catch (e2) {
+      toast.error(e2.message)
+    } finally {
+      setDeleting(false)
+    }
+  }
+
   return (
     <section id="admin-roles" className="bg-app-surface border border-app-border rounded-2xl shadow-card overflow-hidden">
       <div className="px-4 py-3 border-b border-app-border flex items-center justify-between gap-3">
         <div className="text-[12px] font-extrabold tracking-widest uppercase text-app-text">Roles y permisos</div>
         <div className="flex items-center gap-2">
-          <button
-            type="button"
-            onClick={() => setMode('edit')}
-            className={pillCls(mode === 'edit')}
-          >
+          {mode === 'edit' && canDeleteSelected && (
+            <button
+              type="button"
+              disabled={deleting || !selectedRoleId}
+              onClick={() => deleteRole(selectedRoleId)}
+              className="px-3 py-1.5 rounded-card text-[12px] font-bold text-red-600 border border-red-200 hover:bg-red-50 disabled:opacity-50 transition-colors"
+            >
+              {deleting ? 'Eliminando…' : 'Eliminar rol'}
+            </button>
+          )}
+          <button type="button" onClick={() => setMode('edit')} className={pillCls(mode === 'edit')}>
             Editar
           </button>
-          <button
-            type="button"
-            onClick={() => setMode('create')}
-            className={pillCls(mode === 'create')}
-          >
+          <button type="button" onClick={() => setMode('create')} className={pillCls(mode === 'create')}>
             Crear
           </button>
         </div>
@@ -1239,7 +1513,7 @@ function RolesPanel({ roles, perms, onCreated, onUpdated }) {
             title="Crear rol"
             perms={perms}
             saving={saving}
-            initial={{ name: '', description: '', permissions: [] }}
+            initial={{ name: '', description: '', permissions: [], digitalizado_carpetas: [] }}
             onSave={createRole}
           />
         ) : (
@@ -1251,6 +1525,7 @@ function RolesPanel({ roles, perms, onCreated, onUpdated }) {
               name: selectedRole?.name || '',
               description: selectedRole?.description || '',
               permissions: selectedRole?.permissions || [],
+              digitalizado_carpetas: selectedRole?.digitalizado_carpetas || [],
             }}
             onSave={(payload) => updateRole(selectedRoleId, payload)}
             disabled={!selectedRoleId}
@@ -1266,30 +1541,87 @@ function RoleEditor({ title, initial, perms, onSave, saving, disabled, hideName 
   const [name, setName] = useState(initial.name || '')
   const [description, setDescription] = useState(initial.description || '')
   const [selected, setSelected] = useState(new Set(initial.permissions || []))
+  const [carpetaKeys, setCarpetaKeys] = useState(new Set())
+  const [carpetasDisponibles, setCarpetasDisponibles] = useState([])
 
   useEffect(() => {
     setName(initial.name || '')
     setDescription(initial.description || '')
     setSelected(new Set(initial.permissions || []))
-  }, [initial.name, initial.description, (initial.permissions || []).join('|')])
+    setCarpetaKeys(new Set((initial.digitalizado_carpetas || []).map(carpetaKeyFromItem)))
+  }, [
+    initial.name,
+    initial.description,
+    (initial.permissions || []).join('|'),
+    JSON.stringify(initial.digitalizado_carpetas || []),
+  ])
 
-  const grouped = useMemo(() => {
-    const map = new Map()
-    for (const p of perms) {
-      const key = p.resource || 'otros'
-      if (!map.has(key)) map.set(key, [])
-      map.get(key).push(p)
+  useEffect(() => {
+    let cancelled = false
+    apiFetch('/api/apartados/carpetas-disponibles')
+      .then((r) => r.json())
+      .then((data) => {
+        if (!cancelled) setCarpetasDisponibles(Array.isArray(data) ? data : [])
+      })
+      .catch(() => {
+        if (!cancelled) setCarpetasDisponibles([])
+      })
+    return () => {
+      cancelled = true
     }
-    return Array.from(map.entries()).sort((a, b) => a[0].localeCompare(b[0], 'es'))
+  }, [])
+
+  const sections = useMemo(() => {
+    const all = perms || []
+    return VIEW_SECTIONS.map((section) => ({
+      ...section,
+      items: all.filter((p) => section.match(p.name)),
+    })).filter((s) => s.items.length > 0)
   }, [perms])
 
-  function toggle(name2) {
+  const showCarpetaPicker =
+    selected.has('digitalizados:ver') && !selected.has('digitalizados:ver_todo')
+
+  function toggle(permName) {
     setSelected((s) => {
       const next = new Set(s)
-      if (next.has(name2)) next.delete(name2)
-      else next.add(name2)
+      if (next.has(permName)) next.delete(permName)
+      else next.add(permName)
+      if (permName === 'digitalizados:ver_todo' && next.has('digitalizados:ver_todo')) {
+        setCarpetaKeys(new Set())
+      }
+      if (permName === 'digitalizados:ver' && !next.has('digitalizados:ver')) {
+        setCarpetaKeys(new Set())
+      }
       return next
     })
+  }
+
+  function toggleCarpeta(key) {
+    setCarpetaKeys((prev) => {
+      const next = new Set(prev)
+      if (next.has(key)) next.delete(key)
+      else next.add(key)
+      return next
+    })
+  }
+
+  function handleSave() {
+    const payload = {
+      ...(hideName ? {} : { name: name.trim() }),
+      description: description.trim(),
+      permissions: Array.from(selected),
+    }
+    if (selected.has('digitalizados:ver') && !selected.has('digitalizados:ver_todo')) {
+      if (carpetaKeys.size === 0) {
+        toast.error('Seleccioná al menos una carpeta en Digitalizados o activá "Ver todo"')
+        return
+      }
+      payload.digitalizado_carpetas = itemsFromCarpetaKeys(carpetaKeys, carpetasDisponibles)
+    } else {
+      payload.digitalizado_carpetas = []
+    }
+    onSave(payload)
   }
 
   return (
@@ -1324,24 +1656,74 @@ function RoleEditor({ title, initial, perms, onSave, saving, disabled, hideName 
       )}
 
       <div className="mt-3 border border-app-border rounded-2xl overflow-hidden">
-        <div className="max-h-[280px] overflow-y-auto scrollbar-thin divide-y divide-app-border">
-          {grouped.map(([resource, list]) => (
-            <div key={resource} className="p-3">
-              <div className="text-[11px] font-extrabold tracking-widest uppercase text-app-muted mb-2">{resource}</div>
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-                {list.map((p) => (
+        <div className="max-h-[420px] overflow-y-auto scrollbar-thin divide-y divide-app-border">
+          {sections.map((section) => (
+            <div key={section.id} className="p-3">
+              <div className="text-[11px] font-extrabold tracking-widest uppercase text-app-muted mb-2">
+                {section.label}
+              </div>
+              <div className="grid grid-cols-1 gap-2">
+                {section.items.map((p) => (
                   <label key={p.name} className="flex items-start gap-2 text-[12px] text-app-text select-none">
                     <input type="checkbox" checked={selected.has(p.name)} onChange={() => toggle(p.name)} />
                     <span className="min-w-0">
-                      <span className="font-mono">{p.name}</span>
-                      <span className="text-app-muted"> — {p.description || '—'}</span>
+                      <span>{p.description || p.name}</span>
+                      <span className="text-app-muted font-mono text-[10px] block">{p.name}</span>
                     </span>
                   </label>
                 ))}
               </div>
+              {section.id === 'digitalizados' && showCarpetaPicker && (
+                <div className="mt-3 pl-1 border-l-2 border-app-border ml-1 space-y-3">
+                  <div className="text-[11px] text-app-muted">
+                    Carpetas autorizadas (depósito completo o categorías específicas):
+                  </div>
+                  {carpetasDisponibles.length === 0 && (
+                    <div className="text-[12px] text-app-muted">No hay carpetas configuradas en apartados.</div>
+                  )}
+                  {carpetasDisponibles.map((ap) => (
+                    <div key={ap.apartado_id} className="space-y-1.5">
+                      <div className="text-[11px] font-semibold text-app-text">
+                        {ap.apartado_nombre || ap.apartado_codigo}
+                      </div>
+                      {(ap.depositos || []).map((dep) => {
+                        const depKey = carpetaKey(ap.apartado_id, dep.carpeta, '')
+                        return (
+                          <div key={depKey} className="pl-2 space-y-1">
+                            <label className="flex items-center gap-2 text-[12px] text-app-text select-none">
+                              <input
+                                type="checkbox"
+                                checked={carpetaKeys.has(depKey)}
+                                onChange={() => toggleCarpeta(depKey)}
+                              />
+                              <span>{dep.carpeta} (depósito completo)</span>
+                            </label>
+                            {(dep.categorias || []).map((cat) => {
+                              const catKey = carpetaKey(ap.apartado_id, dep.carpeta, cat.nombre)
+                              return (
+                                <label
+                                  key={catKey}
+                                  className="flex items-center gap-2 text-[12px] text-app-muted select-none pl-5"
+                                >
+                                  <input
+                                    type="checkbox"
+                                    checked={carpetaKeys.has(catKey)}
+                                    onChange={() => toggleCarpeta(catKey)}
+                                  />
+                                  <span>{dep.carpeta} / {cat.nombre}</span>
+                                </label>
+                              )
+                            })}
+                          </div>
+                        )
+                      })}
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
           ))}
-          {perms.length === 0 && <div className="p-4 text-[13px] text-app-muted">Sin permisos cargados.</div>}
+          {sections.length === 0 && <div className="p-4 text-[13px] text-app-muted">Sin permisos cargados.</div>}
         </div>
       </div>
 
@@ -1349,7 +1731,7 @@ function RoleEditor({ title, initial, perms, onSave, saving, disabled, hideName 
         <button
           type="button"
           disabled={saving || (!hideName && !name.trim())}
-          onClick={() => onSave({ ...(hideName ? {} : { name: name.trim() }), description: description.trim(), permissions: Array.from(selected) })}
+          onClick={handleSave}
           className="px-4 py-2 rounded-card text-[12px] font-bold text-white bg-teal-600 hover:bg-teal-500 disabled:opacity-50 transition-colors"
         >
           Guardar

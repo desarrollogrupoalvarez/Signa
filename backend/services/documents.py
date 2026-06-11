@@ -27,6 +27,9 @@ logger = logging.getLogger("remitos")
 
 _store: dict[str, dict] = {}
 _lock = threading.Lock()
+_indice_pendientes_cache: dict[int, tuple[float, object]] = {}
+_indice_lock = threading.Lock()
+_INDICE_PENDIENTES_TTL = 45.0
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -38,6 +41,13 @@ def _norm_path_key(path: Path | str) -> str:
 def _doc_id(path: Path) -> str:
     s = _norm_path_key(path)
     return hashlib.md5(s.encode("utf-8", errors="surrogatepass")).hexdigest()[:12]
+
+
+def _recibido_en_from_path(path: Path) -> str:
+    try:
+        return datetime.fromtimestamp(path.stat().st_mtime).isoformat()
+    except OSError:
+        return datetime.now().isoformat()
 
 
 def _sha256(path: Path) -> str:
@@ -121,10 +131,76 @@ def _patch_pending_tango_fields(
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
+def _schedule_index_bandeja(
+    path: Path,
+    apartado_codigo: str,
+    *,
+    tango_clave: str | None = None,
+    tango_fecha: str | None = None,
+) -> None:
+    """Encola indexación de texto (worker único, commit por trabajo)."""
+    from services.comprobante_index_queue import enqueue_pdf_bandeja
+
+    enqueue_pdf_bandeja(
+        path,
+        apartado_codigo,
+        tango_clave=tango_clave,
+        tango_fecha=tango_fecha,
+    )
+
+
+def _indice_pendientes_apartado(apartado) -> object:
+    """Índice de bandeja con cache TTL (un escaneo UNC cada ~45s por apartado)."""
+    from services.comprobante_text_index import IndiceRutasApartado
+
+    aid = int(apartado.id)
+    now = time.monotonic()
+    with _indice_lock:
+        hit = _indice_pendientes_cache.get(aid)
+        if hit and (now - hit[0]) < _INDICE_PENDIENTES_TTL:
+            return hit[1]
+    idx = IndiceRutasApartado.build(apartado, solo_pendientes=True)
+    with _indice_lock:
+        _indice_pendientes_cache[aid] = (now, idx)
+    return idx
+
+
+def invalidate_pendientes_indice(apartado_id: int | None = None) -> None:
+    with _indice_lock:
+        if apartado_id is None:
+            _indice_pendientes_cache.clear()
+        else:
+            _indice_pendientes_cache.pop(int(apartado_id), None)
+    try:
+        from services.comprobante_index_queue import invalidate_indice_cache
+
+        invalidate_indice_cache(apartado_id)
+    except Exception:
+        pass
+
+
+def _memory_pending_index() -> dict[tuple[str, str], dict]:
+    """Mapa (nombre_pdf, apartado_codigo) -> doc pendiente en memoria."""
+    with _lock:
+        out: dict[tuple[str, str], dict] = {}
+        for doc in _store.values():
+            if doc.get("estado") != "pendiente":
+                continue
+            ac = (doc.get("apartado_codigo") or "").strip()
+            nm = (doc.get("nombre") or "").strip()
+            if ac and nm:
+                out[(nm, ac)] = doc
+        return out
+
+
 def register(
     path: Path,
     *,
     silent: bool = False,
+    indexar: bool = True,
+    skip_guard: bool = False,
+    skip_exists_check: bool = False,
+    recibido_en: str | None = None,
     apartado_codigo: str | None = None,
     modo_flujo: str | None = None,
     prefijo: str | None = None,
@@ -141,11 +217,12 @@ def register(
     """
     if path.suffix.lower() != ".pdf":
         return False
-    try:
-        if not path.is_file():
+    if not skip_exists_check:
+        try:
+            if not path.is_file():
+                return False
+        except OSError:
             return False
-    except OSError:
-        return False
 
     if apartado_codigo and modo_flujo is not None and prefijo is not None:
         ac, mf, pr = apartado_codigo.strip(), modo_flujo, (prefijo or "x").strip()
@@ -160,7 +237,7 @@ def register(
     if mf not in ("transferencia", "ingreso"):
         ac, mf, pr = _legacy_categoria_to_apart("tra")
 
-    if should_skip_pending_registration(path, ac, tango_clave=tango_clave):
+    if not skip_guard and should_skip_pending_registration(path, ac, tango_clave=tango_clave):
         return False
 
     fecha_res, usuario_res = _resolve_tango_meta(
@@ -187,11 +264,21 @@ def register(
                     path.name,
                     existing.get("tango_usuario"),
                 )
+            if indexar:
+                _schedule_index_bandeja(
+                    path,
+                    ac,
+                    tango_clave=tango_clave or existing.get("tango_clave"),
+                    tango_fecha=fecha_res or existing.get("tango_fecha"),
+                )
             return True
-        try:
-            file_hash = _sha256(path)
-        except OSError:
-            return False
+        if skip_exists_check:
+            file_hash = ""
+        else:
+            try:
+                file_hash = _sha256(path)
+            except OSError:
+                return False
         _store[doc_id] = {
             "id": doc_id,
             "nombre": path.name,
@@ -201,7 +288,10 @@ def register(
             "modo_flujo": mf,
             "prefijo": pr,
             "categoria": _categoria_ui(mf),
-            "recibido_en": datetime.fromtimestamp(path.stat().st_mtime).isoformat(),
+            "recibido_en": (
+                (recibido_en or "").strip()
+                or _recibido_en_from_path(path)
+            ),
             "firmado_en": None,
             "dispositivo": None,
             "hash_original": file_hash,
@@ -214,6 +304,13 @@ def register(
     cat_log = categoria or ac
     if not silent:
         logger.info("NUEVO_DOCUMENTO | id=%s | archivo=%s | apartado=%s", doc_id, path.name, cat_log)
+    if indexar:
+        _schedule_index_bandeja(
+            path,
+            ac,
+            tango_clave=tango_clave,
+            tango_fecha=fecha_res,
+        )
     return True
 
 
@@ -348,6 +445,168 @@ def is_path_same_bandeja(ruta: str, bandeja: str) -> bool:
     return _pendiente_misma_bandeja(ruta, Path(bandeja))
 
 
+def _doc_api_dict(doc: dict) -> dict:
+    return {k: v for k, v in doc.items() if k != "ruta"}
+
+
+def ensure_pending_from_comprobante(
+    apartado,
+    row: dict,
+    *,
+    indice=None,
+    memory_index: dict[tuple[str, str], dict] | None = None,
+    silent: bool = True,
+) -> dict | None:
+    """
+    Enlaza fila BD pendiente al store en memoria (id para firmar).
+    Usa índice de bandeja pre-escaneado y cache en memoria para evitar N×UNC.
+    """
+    from services.comprobante_text_index import resolver_ruta_comprobante
+
+    pdf_fn = (row.get("pdf_filename") or row.get("nombre") or "").strip()
+    if not pdf_fn:
+        return None
+
+    ac = (row.get("apartado_codigo") or getattr(apartado, "codigo", "") or "").strip()
+    if memory_index is not None:
+        cached = memory_index.get((pdf_fn, ac))
+        if cached:
+            return _doc_api_dict(cached)
+
+    path = resolver_ruta_comprobante(
+        apartado,
+        pdf_fn,
+        "pendiente",
+        ruta_guardada=None,
+        indice=indice,
+    )
+    if not path:
+        return None
+
+    clave = (row.get("clave") or "").strip() or None
+    tango_fecha = row.get("tango_fecha") or row.get("fecha")
+    mf = row.get("modo_flujo") or getattr(apartado, "modo_flujo", "transferencia")
+    pr = row.get("prefijo") or getattr(apartado, "prefijo", "x")
+
+    register(
+        path,
+        silent=silent,
+        indexar=False,
+        skip_guard=True,
+        skip_exists_check=True,
+        recibido_en=row.get("recibido_en"),
+        apartado_codigo=ac,
+        modo_flujo=mf,
+        prefijo=pr,
+        tango_clave=clave if clave and not clave.startswith("bandeja:") else None,
+        tango_fecha=tango_fecha,
+    )
+    doc = get(_doc_id(path))
+    if not doc:
+        return None
+    if memory_index is not None:
+        memory_index[(pdf_fn, ac)] = doc
+    return _doc_api_dict(doc)
+
+
+def list_pending_from_bd(
+    db,
+    aps: list,
+    allowed_codes: set[str],
+    *,
+    filter_username: str | None = None,
+    filter_fecha: str | None = None,
+    filter_q: str | None = None,
+) -> list[dict]:
+    """Pendientes desde comprobante_tango (estado=pendiente) enlazados al store."""
+    from services.comprobante_search import (
+        buscar_comprobantes,
+        listar_pendientes_comprobantes,
+    )
+
+    aps_f = [a for a in aps if getattr(a, "codigo", None) in allowed_codes]
+    if not aps_f:
+        return []
+
+    want_user = _norm_tango_usuario(filter_username)
+    want_fecha = (filter_fecha or "").strip()[:10] or None
+    q = (filter_q or "").strip() or None
+
+    apartado_by_codigo = {a.codigo: a for a in aps_f}
+    indices: dict[int, object] = {}
+    for apartado in aps_f:
+        indices[int(apartado.id)] = _indice_pendientes_apartado(apartado)
+
+    from services.comprobante_index_queue import encolar_pendientes_sin_texto
+
+    n_enc = encolar_pendientes_sin_texto(
+        db,
+        aps_f,
+        filter_fecha=want_fecha,
+    )
+    if n_enc:
+        logger.debug("INDEX_PENDIENTES_ENCOLADOS | n=%d", n_enc)
+
+    if q:
+        bd_rows = buscar_comprobantes(
+            db,
+            q,
+            estado="pendiente",
+            apartado_ids=[int(a.id) for a in aps_f],
+        )
+        meta_rows = [
+            {
+                "pdf_filename": (r.get("pdf_filename") or r.get("nombre") or "").strip(),
+                "nombre": (r.get("pdf_filename") or r.get("nombre") or "").strip(),
+                "clave": r.get("clave") or "",
+                "apartado_codigo": r.get("apartado_codigo") or r.get("origen") or "",
+                "modo_flujo": r.get("modo_flujo"),
+                "prefijo": None,
+                "tango_fecha": r.get("fecha"),
+                "fragmento": r.get("fragmento") or "",
+            }
+            for r in bd_rows
+        ]
+    else:
+        meta_rows = listar_pendientes_comprobantes(
+            db, aps_f, filter_fecha=want_fecha
+        )
+
+    memory_index = _memory_pending_index()
+    docs: list[dict] = []
+    seen_ids: set[str] = set()
+
+    for row in meta_rows:
+        ac = (row.get("apartado_codigo") or "").strip()
+        apartado = apartado_by_codigo.get(ac)
+        if not apartado:
+            continue
+        doc = ensure_pending_from_comprobante(
+            apartado,
+            row,
+            indice=indices.get(int(apartado.id)),
+            memory_index=memory_index,
+        )
+        if not doc:
+            continue
+        enrich_tango_meta(doc)
+        owner = _norm_tango_usuario(doc.get("tango_usuario"))
+        if want_user and (not owner or owner != want_user):
+            continue
+        doc_fecha = doc.get("tango_fecha")
+        if want_fecha and doc_fecha and doc_fecha != want_fecha:
+            continue
+        if doc["id"] in seen_ids:
+            continue
+        seen_ids.add(doc["id"])
+        frag = (row.get("fragmento") or "").strip()
+        if frag:
+            doc = {**doc, "fragmento": frag}
+        docs.append(doc)
+
+    return sorted(docs, key=lambda d: d.get("recibido_en") or "", reverse=True)
+
+
 def list_pending(
     allowed_apartado_codes: set[str] | None = None,
     *,
@@ -473,6 +732,7 @@ def scan_inbox(
     from services import apartados as apartados_svc
     from services.apartado_paths import infer_tango_fuente_from_path, iter_bandeja_inbox_pdfs
 
+    a = None
     db = SessionLocal()
     try:
         a = apartados_svc.get_by_codigo(db, apartado_codigo, active_only=False)
@@ -487,6 +747,7 @@ def scan_inbox(
         register(
             pdf,
             silent=True,
+            indexar=False,
             apartado_codigo=apartado_codigo,
             modo_flujo=modo_flujo,
             prefijo=prefijo,
@@ -495,6 +756,10 @@ def scan_inbox(
             tango_fuente=infer_tango_fuente_from_path(pdf),
             origen="bandeja",
         )
+    if a:
+        from services.comprobante_index_queue import encolar_pendientes_apartado
+
+        encolar_pendientes_apartado(int(a.id), limit=50)
     with _lock:
         total = sum(1 for d in _store.values() if d["estado"] == "pendiente")
     logger.info("Bandeja %s escaneada (pendientes en memoria: %s)", apartado_codigo, total)
@@ -598,6 +863,41 @@ def start_watcher(bandeja: Path, apartado_codigo: str, modo_flujo: str, prefijo:
     return obs
 
 
+def start_bandejas_boot(b_list: list[tuple[Path, str, str, str]]) -> threading.Thread | None:
+    """
+    Arranca watchers y escaneo inicial de bandejas en segundo plano
+    (no bloquea el servidor en rutas UNC lentas).
+    """
+    if not b_list:
+        return None
+
+    def _run() -> None:
+        for pth, ac, mf, pr in b_list:
+            if not pth or not str(pth).strip():
+                continue
+            try:
+                start_watcher(pth, apartado_codigo=ac, modo_flujo=mf, prefijo=pr)
+            except Exception as ex:
+                logger.warning("Watcher bandeja %s | %s", ac, ex)
+        for pth, ac, mf, pr in b_list:
+            if not pth or not str(pth).strip():
+                continue
+            try:
+                logger.info("Escaneo inicial bandeja %s (background)...", ac)
+                scan_inbox(pth, apartado_codigo=ac, modo_flujo=mf, prefijo=pr)
+            except Exception as ex:
+                logger.warning("Escaneo inicial bandeja %s | %s", ac, ex)
+        logger.info("Arranque de bandejas completado (%d apartado(s))", len(b_list))
+
+    th = threading.Thread(target=_run, name="boot-bandejas", daemon=True)
+    th.start()
+    logger.info(
+        "Bandejas: watchers y escaneo inicial en segundo plano (%d apartado(s))",
+        len(b_list),
+    )
+    return th
+
+
 def start_rescan_loop(get_bandeja_tuples, interval: float = 60.0):
     stop = threading.Event()
 
@@ -617,9 +917,13 @@ def start_rescan_loop(get_bandeja_tuples, interval: float = 60.0):
                         a = apartados_svc.get_by_codigo(db, ac, active_only=False)
                         pdfs = iter_bandeja_inbox_pdfs(a) if a else []
                         for pdf in pdfs:
+                            doc_id = _doc_id(pdf)
+                            with _lock:
+                                era_nuevo = doc_id not in _store
                             if register(
                                 pdf,
                                 silent=True,
+                                indexar=era_nuevo,
                                 apartado_codigo=ac,
                                 modo_flujo=mf,
                                 prefijo=pr,

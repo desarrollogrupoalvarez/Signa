@@ -755,12 +755,22 @@ def _filas_relleno_tabla_hasta_total_rcv(
     return filas, alto_marco, outset
 
 
+def _indexar_texto_post_generacion(out: Path, comprobante_id: int | None = None) -> None:
+    try:
+        from services.comprobante_text_index import persistir_texto_comprobante
+
+        persistir_texto_comprobante(out, comprobante_id)
+    except Exception:
+        pass
+
+
 def generar_transferencia_pdf(
     datos: DatosComprobanteTransferencia,
     ruta_salida: str | Path,
     *,
     titulo: str = "TRANSFERENCIA ENTRE DEPOSITOS",
     altura_minima_marco_mm: float | None = None,
+    comprobante_id: int | None = None,
 ) -> Path:
     global _zona_firma_rect
     _zona_firma_rect = None
@@ -896,6 +906,7 @@ def generar_transferencia_pdf(
     p1, p2 = _fabricar_marcados_pagina(doc, alto_m, outset)
     doc.build(story, onFirstPage=p1, onLaterPages=p2)
     _anotar_zona_firma_pdf(out, _zona_firma_rect)
+    _indexar_texto_post_generacion(out, comprobante_id)
     return out
 
 
@@ -905,6 +916,7 @@ def generar_recepcion_pdf(
     *,
     titulo: str = "INFORME DE RECEPCIÓN",
     altura_minima_marco_mm: float | None = None,
+    comprobante_id: int | None = None,
 ) -> Path:
     out = Path(ruta_salida).expanduser().resolve()
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -1065,6 +1077,7 @@ def generar_recepcion_pdf(
 
     p1, p2 = _fabricar_marcados_pagina(doc, alto_mc, outset)
     doc.build(story, onFirstPage=p1, onLaterPages=p2)
+    _indexar_texto_post_generacion(out, comprobante_id)
     return out
 
 

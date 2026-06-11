@@ -25,7 +25,7 @@ def require_auth(permission: str | list[str] | None = None):
 
     Usage:
         @require_auth()                         # just authenticated
-        @require_auth("documentos:firmar")      # authenticated + specific permission
+        @require_auth("pendientes:firmar")      # authenticated + specific permission
         @require_auth(["apartados:crear", "apartados:gestionar"])
     """
     def decorator(f):

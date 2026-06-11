@@ -26,6 +26,7 @@ def create_role():
             name=(data.get("name") or "").strip(),
             description=(data.get("description") or "").strip(),
             permissions=data.get("permissions") or [],
+            digitalizado_carpetas=data.get("digitalizado_carpetas"),
         )
         g.db.commit()
         return jsonify(role), 201
@@ -41,6 +42,19 @@ def update_role(role_id):
         role = UsersService(g.db).update_role(role_id, data)
         g.db.commit()
         return jsonify(role)
+    except LookupError as e:
+        abort(404, str(e))
+    except ValueError as e:
+        abort(400, str(e))
+
+
+@bp.route("/roles/<int:role_id>", methods=["DELETE"])
+@require_auth("roles:eliminar")
+def delete_role(role_id):
+    try:
+        role = UsersService(g.db).delete_role(role_id)
+        g.db.commit()
+        return jsonify({"ok": True, "role": role})
     except LookupError as e:
         abort(404, str(e))
     except ValueError as e:
@@ -73,11 +87,15 @@ def create_user():
         apartado_ids = data.get("apartado_ids")
         if apartado_ids is not None and not isinstance(apartado_ids, list):
             abort(400, "apartado_ids debe ser una lista de ids")
+        area_ids = data.get("area_ids")
+        if area_ids is not None and not isinstance(area_ids, list):
+            abort(400, "area_ids debe ser una lista de ids")
         user = UsersService(g.db).create_user(
             username=data["username"].strip(),
             password=data["password"],
             role_name=data["role"].strip(),
             apartado_ids=[int(x) for x in (apartado_ids or []) if x is not None] if apartado_ids is not None else None,
+            area_ids=[int(x) for x in (area_ids or []) if x is not None] if area_ids is not None else None,
         )
         g.db.commit()
         return jsonify(user), 201

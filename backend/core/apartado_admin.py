@@ -15,6 +15,12 @@ PERM_EDITAR = "apartados:editar"
 PERM_RUTAS_LEGACY = "configuracion:rutas"
 
 
+def user_puede_ver_todos_pendientes(perms: set[str]) -> bool:
+    from core.permissions import user_puede_ver_todos_pendientes as _fn
+
+    return _fn(perms)
+
+
 def permissions_from_payload(payload: dict | None) -> set[str]:
     return set((payload or {}).get("permissions") or [])
 
@@ -78,8 +84,13 @@ def query_apartados_admin(
     perms: set[str],
 ) -> "Query":
     from models.apartado import Apartado
+    from models.area import Area
 
-    q = db.query(Apartado).order_by(Apartado.orden, Apartado.codigo)
+    q = (
+        db.query(Apartado)
+        .outerjoin(Area, Apartado.area_id == Area.id)
+        .order_by(Area.orden, Apartado.orden, Apartado.codigo)
+    )
     if (
         can_gestionar_todos(perms, role_name)
         or PERM_CREAR in perms
@@ -102,9 +113,13 @@ def query_apartados_asignables(
 ) -> "Query":
     """Lista para asignar apartados a usuarios (checkboxes en admin)."""
     from models.apartado import Apartado
+    from models.area import Area
 
-    q = db.query(Apartado).filter(Apartado.activo.is_(True)).order_by(
-        Apartado.orden, Apartado.codigo
+    q = (
+        db.query(Apartado)
+        .outerjoin(Area, Apartado.area_id == Area.id)
+        .filter(Apartado.activo.is_(True))
+        .order_by(Area.orden, Apartado.orden, Apartado.codigo)
     )
     if can_gestionar_todos(perms, role_name):
         return q

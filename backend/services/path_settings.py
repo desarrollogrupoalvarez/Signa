@@ -1,8 +1,7 @@
 """
-Rutas efectivas: filas `apartados` (transferencias / ingresos) o, si faltan,
-variables de entorno como fallback.
+Rutas efectivas: apartados por modo_flujo o, si faltan, variables de entorno como fallback.
 
-NOTA: `app_settings` fue eliminado por decisión de diseño.
+NOTA: `app_settings` fue eliminado por decision de diseno.
 """
 
 from __future__ import annotations
@@ -32,11 +31,18 @@ def _norm_ruta(s: str) -> str:
     return os.path.normpath(t) if t else t
 
 
+def _is_unc_path(path: Path | str) -> bool:
+    s = str(path).replace("/", "\\")
+    return s.startswith("\\\\")
+
+
 def resolve_storage_path(path_str: str | None) -> Path:
     """
     Ruta absoluta para bandeja/destino.
     Relativas: primero respecto al cwd del proceso (p. ej. backend/ al usar server.py),
-    luego raíz del proyecto — debe coincidir con dónde el watcher ya encuentra pendientes.
+    luego raiz del proyecto — debe coincidir con donde el watcher ya encuentra pendientes.
+
+    Rutas UNC (\\\\servidor\\share): no usa resolve()/exists() para evitar cuelgues en red.
     """
     from config import Config
 
@@ -45,23 +51,41 @@ def resolve_storage_path(path_str: str | None) -> Path:
         return Path()
     p = Path(raw)
     if p.is_absolute():
+        if _is_unc_path(p):
+            return Path(os.path.normpath(str(p)))
         try:
             return p.resolve()
         except OSError:
             return p
-    cand_cwd = (Path.cwd() / p).resolve()
-    cand_base = (Config.BASE_DIR / p).resolve()
-    if cand_cwd.exists():
-        return cand_cwd
-    if cand_base.exists():
-        return cand_base
-    return cand_cwd
+    cand_cwd = Path.cwd() / p
+    cand_base = Config.BASE_DIR / p
+    if _is_unc_path(cand_cwd):
+        return Path(os.path.normpath(str(cand_cwd)))
+    try:
+        cand_cwd_res = cand_cwd.resolve()
+    except OSError:
+        cand_cwd_res = cand_cwd
+    try:
+        cand_base_res = cand_base.resolve()
+    except OSError:
+        cand_base_res = cand_base
+    try:
+        if cand_cwd_res.exists():
+            return cand_cwd_res
+    except OSError:
+        pass
+    try:
+        if cand_base_res.exists():
+            return cand_base_res
+    except OSError:
+        pass
+    return cand_cwd_res
 
 
 def get_legacy_merged(db: "Session | None" = None) -> dict[str, str]:
     """
     Fallback legacy: solo env (sin pasar por tablas `apartados`).
-    Útil para el seed inicial si la BD aún no tiene apartados creados.
+    Util para el seed inicial si la BD aun no tiene apartados creados.
     """
     bandeja = (Config.BANDEJA_ENTRADA or "").strip()
     trans_root = (Config.TRANSFERENCIAS_ROOT or "").strip()
@@ -76,10 +100,23 @@ def get_legacy_merged(db: "Session | None" = None) -> dict[str, str]:
     }
 
 
+def _default_apartado_for_modo(db: "Session", modo_flujo: str):
+    from models.apartado import Apartado
+    from models.area import Area
+
+    return (
+        db.query(Apartado)
+        .outerjoin(Area, Apartado.area_id == Area.id)
+        .filter(Apartado.modo_flujo == modo_flujo, Apartado.activo.is_(True))
+        .order_by(Area.orden, Apartado.orden, Apartado.codigo)
+        .first()
+    )
+
+
 def get_resolved_paths(db: "Session | None" = None) -> dict[str, str]:
     """
-    bandeja (TRA), transferencias, bandeja IN y destino IN. Si existen en BD las
-    filas de apartados `transferencias` e `ingresos`, se usan; si no, env.
+    bandeja (TRA), transferencias, bandeja IN y destino IN.
+    Usa el primer apartado activo por modo_flujo (ordenado por area); si no, env.
     """
     global _cache
     with _lock:
@@ -87,18 +124,8 @@ def get_resolved_paths(db: "Session | None" = None) -> dict[str, str]:
             return dict(_cache)
 
         if db is not None:
-            from models.apartado import Apartado
-
-            t = (
-                db.query(Apartado)
-                .filter(Apartado.codigo == "transferencias", Apartado.activo.is_(True))
-                .first()
-            )
-            i = (
-                db.query(Apartado)
-                .filter(Apartado.codigo == "ingresos", Apartado.activo.is_(True))
-                .first()
-            )
+            t = _default_apartado_for_modo(db, "transferencia")
+            i = _default_apartado_for_modo(db, "ingreso")
             if t and i:
                 result = {
                     "bandeja_entrada": _norm_ruta(t.bandeja_path),
@@ -106,8 +133,7 @@ def get_resolved_paths(db: "Session | None" = None) -> dict[str, str]:
                     "bandeja_ingresos": _norm_ruta(i.bandeja_path),
                     "destino_ingresos": _norm_ruta(i.destino_path),
                 }
-                if db is not None:
-                    _cache = result
+                _cache = result
                 return result
 
         result = get_legacy_merged(db)
